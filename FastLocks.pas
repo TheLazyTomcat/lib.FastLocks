@@ -1,3 +1,61 @@
+{-------------------------------------------------------------------------------
+
+  This Source Code Form is subject to the terms of the Mozilla Public
+  License, v. 2.0. If a copy of the MPL was not distributed with this
+  file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+-------------------------------------------------------------------------------}
+{===============================================================================
+
+  FastLocks
+
+    Non-blocking synchronization objects based on interlocked functions
+    operating on locking flag(s).
+
+  ©František Milt 2016-02-18
+
+  Version 1.0 alpha (needs extensive testing)
+
+  Notes:
+    - provided synchronizers are non-blocking - acquire operation returns
+      immediatelly and its result signals whether the synchronizer was acquired
+      or not
+    - there is absolutely no deadlock prevention - be extremely carefull when
+      trying to acquire synchronizer in more than one place in a single thread
+      (trying to acquire synchronizer second time in the same thread will fail,
+      with exception being MREW reading, which is given by concept of multiple
+      readers access)
+    - use provided wait methods only when necessary - synchronizers are intended
+      to be used as non blocking
+    - waiting is always active (spinning) - do not wait for prolonged time
+      intervals as it might starve other threads; use infinite waiting only in
+      extreme cases and only when really necessary
+    - use synchronization by provided objects only on very short (in time,
+      not code) routines - do not use to synchronize code that is executing
+      longer than few milliseconds
+    - every acquire of a synchronizer MUST be paired by a release, synhronizers
+      are not automalically released   
+
+--------------------------------------------------------------------------------
+
+  Example on how to use non-blocking character of provided objects:
+
+ -->  // some code
+ |    If CritSect.Enter then
+ |      try
+ |        // synchronized code
+ |      finally
+ |        CritSect.Leave;
+ |      end
+ |    else
+ |      begin
+ |       // synchronization not possible, do other things that does not need
+ |       // to be synchronized
+ |      end;
+ |    // some code
+ --   // repeat from start and try synchronization again if needed
+
+===============================================================================}
 unit FastLocks;
 
 {$IFDEF FPC}
@@ -18,6 +76,12 @@ type
 
   TFLWaitResult = (wrAcquired,wrTimeOut,wrError);
 
+{==============================================================================}
+{------------------------------------------------------------------------------}
+{                                   TFastLock                                  }
+{------------------------------------------------------------------------------}
+{==============================================================================}
+
   TFastLock = class(TObject)
   protected
     fMainFlag:      Integer;
@@ -31,10 +95,12 @@ type
     property WaitSpinCount: UInt32 read fWaitSpinCount;
   end;
 
-{
-  bit 0..7  - acquire count
-  bit 8..31 - reserve count
-}
+{==============================================================================}
+{------------------------------------------------------------------------------}
+{                             TFastCriticalSection                             }
+{------------------------------------------------------------------------------}
+{==============================================================================}
+
   TFastCriticalSection = class(TFastLock)
   protected
     Function Acquire(Reserved: Boolean): Boolean; virtual;
@@ -48,11 +114,12 @@ type
     Function WaitToEnter(Timeout: UInt32; WaitSpin: Boolean = True; Reservation: Boolean = True): TFLWaitResult; virtual;
   end;
 
-{
-  bit 0..13   - read count
-  bit 14..27  - write reservation count
-  bit 28..31  - write count
-}
+{==============================================================================}
+{------------------------------------------------------------------------------}
+{                   TFastMultiReadExclusiveWriteSynchronizer                   }
+{------------------------------------------------------------------------------}
+{==============================================================================}
+
   TFastMultiReadExclusiveWriteSynchronizer = class(TFastLock)
   protected
     Function AcquireRead({%H-}Reserved: Boolean): Boolean; virtual;
@@ -79,9 +146,19 @@ implementation
 uses
   Windows, SysUtils;
 
+{==============================================================================}
+{   Imlementation constants                                                    }
+{==============================================================================}
+
 const
   FASTLOCK_UNLOCKED = Integer(0);
 
+{
+  Meaning of bits in main flag word in TFastCriticaSection:
+
+    bit 0..7  - acquire count
+    bit 8..31 - reserve count
+}
   FASTLOCK_CS_ACQUIREDELTA    = 1;
   FASTLOCK_CS_ACQUIREMASK     = Integer($000000FF);
   FASTLOCK_CS_ERRACQUIRECOUNT = 200;
@@ -90,17 +167,36 @@ const
   FASTLOCK_CS_RESERVEMASK     = Integer($0FFFFF00);
   FASTLOCK_CS_RESERVEBITSHIFT = 8;
 
-  FASTLOCK_MREW_MAXREADERS           = 10000 {must be lower than 16383};
+{
+  Meaning of bits in main flag word in TFastMultiReadExclusiveWriteSynchronizer:
+
+    bit 0..13   - read count
+    bit 14..27  - write reservation count
+    bit 28..31  - write count
+}
+  FASTLOCK_MREW_MAXREADERS           = 10000 {must be lower than $3FFF (16383)};
   FASTLOCK_MREW_READERDELTA          = 1;
   FASTLOCK_MREW_WRITERESERVEDELTA    = Integer($4000);
-  FASTLOCK_MREW_WRITERESERVEMAX      = 10000 {must be lower than 16383};
+  FASTLOCK_MREW_WRITERESERVEMAX      = 10000 {must be lower than $3FFF (16383)};
   FASTLOCK_MREW_WRITERESERVEMASK     = Integer($0FFFC000);
   FASTLOCK_MREW_WRITERESERVEBITSHIFT = 14;
   FASTLOCK_MREW_WRITEDELTA           = Integer($10000000);
   FASTLOCK_MREW_WRITEBITSHIFT        = 28;
   FASTLOCK_MREW_ERRWRITECOUNT        = 8;
 
-//==============================================================================
+{==============================================================================}
+{------------------------------------------------------------------------------}
+{                                   TFastLock                                  }
+{------------------------------------------------------------------------------}
+{==============================================================================}
+
+{==============================================================================}
+{   TFastLock - implementation                                                 }
+{==============================================================================}
+
+{------------------------------------------------------------------------------}
+{   TFastLock - protected methods                                              }
+{------------------------------------------------------------------------------}
 
 Function TFastLock.SpinOn(SpinCount: UInt32; WaitMethod: TFLWaitMethod; Reserve: TFLReserveMethod = nil; Unreserve: TFLReserveMethod = nil): TFLWaitResult;
 
@@ -195,7 +291,9 @@ else
   end;
 end;
 
-//==============================================================================
+{------------------------------------------------------------------------------}
+{   TFastLock - public methods                                                 }
+{------------------------------------------------------------------------------}
 
 constructor TFastLock.Create(WaitSpinCount: UInt32 = DefaultWaitSpinCount);
 begin
@@ -208,7 +306,20 @@ If not QueryPerformanceFrequency(fPerfCntFreq) then
   raise Exception.CreateFmt('TFastLock.Create: Cannot obtain performance counter frequency (0x%.8x).',[GetLastError]);
 end;
 
-//******************************************************************************
+
+{==============================================================================}
+{------------------------------------------------------------------------------}
+{                             TFastCriticalSection                             }
+{------------------------------------------------------------------------------}
+{==============================================================================}
+
+{==============================================================================}
+{   TFastCriticalSection - implementation                                      }
+{==============================================================================}
+
+{------------------------------------------------------------------------------}
+{   TFastCriticalSection - protected methods                                   }
+{------------------------------------------------------------------------------}
 
 Function TFastCriticalSection.Acquire(Reserved: Boolean): Boolean;
 var
@@ -253,7 +364,9 @@ begin
 InterlockedExchangeAdd(fMainFlag,-FASTLOCK_CS_RESERVEDELTA);
 end;
 
-//==============================================================================
+{------------------------------------------------------------------------------}
+{   TFastCriticalSection - public methods                                      }
+{------------------------------------------------------------------------------}
 
 Function TFastCriticalSection.Enter: Boolean;
 begin
@@ -287,7 +400,20 @@ else
   Result := WaitOn(Timeout,Acquire,WaitSpin,nil,nil);
 end;
 
-//******************************************************************************
+
+{==============================================================================}
+{------------------------------------------------------------------------------}
+{                   TFastMultiReadExclusiveWriteSynchronizer                   }
+{------------------------------------------------------------------------------}
+{==============================================================================}
+
+{==============================================================================}
+{   TFastMultiReadExclusiveWriteSynchronizer - implementation                  }
+{==============================================================================}
+
+{------------------------------------------------------------------------------}
+{   TFastMultiReadExclusiveWriteSynchronizer - protected methods               }
+{------------------------------------------------------------------------------}
 
 Function TFastMultiReadExclusiveWriteSynchronizer.AcquireRead(Reserved: Boolean): Boolean;
 begin
@@ -348,7 +474,9 @@ begin
 InterlockedExchangeAdd(fMainFlag,-FASTLOCK_MREW_WRITERESERVEDELTA);
 end;
 
-//******************************************************************************
+{------------------------------------------------------------------------------}
+{   TFastMultiReadExclusiveWriteSynchronizer - public methods                  }
+{------------------------------------------------------------------------------}
 
 Function TFastMultiReadExclusiveWriteSynchronizer.BeginRead: Boolean;
 begin
