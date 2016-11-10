@@ -34,7 +34,10 @@
       not code) routines - do not use to synchronize code that is executing
       longer than few milliseconds
     - every acquire of a synchronizer MUST be paired by a release, synhronizers
-      are not automalically released   
+      are not automalically released
+
+  Dependencies:
+    AuxTypes - github.com/ncs-sniper/Lib.AuxTypes
 
 --------------------------------------------------------------------------------
 
