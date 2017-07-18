@@ -65,6 +65,8 @@ unit FastLocks;
   {$MODE Delphi}
 {$ENDIF}
 
+{$TYPEINFO ON}
+
 interface
 
 uses
