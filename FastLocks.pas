@@ -63,6 +63,7 @@ unit FastLocks;
 
 {$IFDEF FPC}
   {$MODE Delphi}
+  {$DEFINE FPC_DisableWarns}
 {$ENDIF}
 
 {$TYPEINFO ON}
@@ -127,7 +128,7 @@ type
 
   TFastMultiReadExclusiveWriteSynchronizer = class(TFastLock)
   protected
-    Function AcquireRead({%H-}Reserved: Boolean): Boolean; virtual;
+    Function AcquireRead(Reserved: Boolean): Boolean; virtual;
     procedure ReleaseRead; virtual;
     Function AcquireWrite(Reserved: Boolean): Boolean; virtual;
     procedure ReleaseWrite; virtual;
@@ -150,6 +151,12 @@ implementation
 
 uses
   Windows, SysUtils;
+
+{$IFDEF FPC_DisableWarns}
+  {$WARN 4055 OFF} // Conversion between ordinals and pointers is not portable
+  {$WARN 5024 OFF} // Parameter "$1" not used
+  {$WARN 5057 OFF} // Local variable "$1" does not seem to be initialized
+{$ENDIF}
 
 {==============================================================================}
 {   Imlementation constants                                                    }
@@ -250,7 +257,7 @@ var
   var
     CurrentCount: Int64;
   begin
-    QueryPerformanceCounter({%H-}CurrentCount);
+    QueryPerformanceCounter(CurrentCount);
     If CurrentCount < StartCount then
       Result := ((High(Int64) - StartCount + CurrentCount) * 1000) div fPerfCntFreq
     else
@@ -279,7 +286,7 @@ If TimeOut = INFINITE then
   Result := SpinOn(INFINITE,WaitMethod,Reserve,Unreserve)
 else
   begin
-    If QueryPerformanceCounter({%H-}StartCount) then
+    If QueryPerformanceCounter(StartCount) then
       begin
         If Assigned(Reserve) and Assigned(Unreserve) then
           begin
@@ -304,7 +311,7 @@ constructor TFastLock.Create(WaitSpinCount: UInt32 = DefaultWaitSpinCount);
 begin
 inherited Create;
 fMainFlag := FASTLOCK_UNLOCKED;
-If ({%H-}PtrUInt(Addr(fMainFlag)) and 3) <> 0 then
+If (PtrUInt(Addr(fMainFlag)) and 3) <> 0 then
   raise Exception.CreateFmt('TFastLock.Create: Main flag (0x%p) is not properly aligned.',[Addr(fMainFlag)]);
 fWaitSpinCount := WaitSpinCount;
 If not QueryPerformanceFrequency(fPerfCntFreq) then
