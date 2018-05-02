@@ -37,7 +37,8 @@
       are not automalically released
 
   Dependencies:
-    AuxTypes - github.com/ncs-sniper/Lib.AuxTypes
+    AuxTypes   - github.com/ncs-sniper/Lib.AuxTypes
+    AuxClasses - github.com/ncs-sniper/Lib.AuxClasses
 
 --------------------------------------------------------------------------------
 
@@ -71,7 +72,7 @@ unit FastLocks;
 interface
 
 uses
-  AuxTypes;
+  AuxTypes, AuxClasses;
 
 const
   DefaultWaitSpinCount = 1500; // around 100us (microseconds) on C2D T7100 @1.8GHz
@@ -88,7 +89,7 @@ type
 {------------------------------------------------------------------------------}
 {==============================================================================}
 
-  TFastLock = class(TObject)
+  TFastLock = class(TCustomObject)
   protected
     fMainFlag:      Integer;
     fWaitSpinCount: UInt32;
