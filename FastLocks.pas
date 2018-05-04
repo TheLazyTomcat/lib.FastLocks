@@ -65,6 +65,7 @@ unit FastLocks;
 {$IFDEF FPC}
   {$MODE Delphi}
   {$DEFINE FPC_DisableWarns}
+  {$MACRO ON}
 {$ENDIF}
 
 {$TYPEINFO ON}
@@ -154,9 +155,10 @@ uses
   Windows, SysUtils;
 
 {$IFDEF FPC_DisableWarns}
-  {$WARN 4055 OFF} // Conversion between ordinals and pointers is not portable
-  {$WARN 5024 OFF} // Parameter "$1" not used
-  {$WARN 5057 OFF} // Local variable "$1" does not seem to be initialized
+  {$DEFINE FPCDWM}
+  {$DEFINE W4055:={$WARN 4055 OFF}} // Conversion between ordinals and pointers is not portable
+  {$DEFINE W5024:={$WARN 5024 OFF}} // Parameter "$1" not used
+  {$DEFINE W5057:={$WARN 5057 OFF}} // Local variable "$1" does not seem to be initialized
 {$ENDIF}
 
 {==============================================================================}
@@ -250,6 +252,7 @@ end;
 
 //------------------------------------------------------------------------------
 
+{$IFDEF FPCDWM}{$PUSH}W5057{$ENDIF}
 Function TFastLock.WaitOn(TimeOut: UInt32; WaitMethod: TFLWaitMethod; WaitSpin: Boolean = True; Reserve: TFLReserveMethod = nil; Unreserve: TFLReserveMethod = nil): TFLWaitResult;
 var
   StartCount: Int64;
@@ -303,6 +306,7 @@ else
     else Result := wrError;
   end;
 end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
 
 {------------------------------------------------------------------------------}
 {   TFastLock - public methods                                                 }
@@ -312,7 +316,9 @@ constructor TFastLock.Create(WaitSpinCount: UInt32 = DefaultWaitSpinCount);
 begin
 inherited Create;
 fMainFlag := FASTLOCK_UNLOCKED;
+{$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
 If (PtrUInt(Addr(fMainFlag)) and 3) <> 0 then
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
   raise Exception.CreateFmt('TFastLock.Create: Main flag (0x%p) is not properly aligned.',[Addr(fMainFlag)]);
 fWaitSpinCount := WaitSpinCount;
 If not QueryPerformanceFrequency(fPerfCntFreq) then
@@ -428,12 +434,14 @@ end;
 {   TFastMultiReadExclusiveWriteSynchronizer - protected methods               }
 {------------------------------------------------------------------------------}
 
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
 Function TFastMultiReadExclusiveWriteSynchronizer.AcquireRead(Reserved: Boolean): Boolean;
 begin
 Result := InterlockedExchangeAdd(fMainFlag,FASTLOCK_MREW_READERDELTA) <= FASTLOCK_MREW_MAXREADERS;
 If not Result then
   InterlockedExchangeAdd(fMainFlag,-FASTLOCK_MREW_READERDELTA);
 end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
 
 //------------------------------------------------------------------------------
 
