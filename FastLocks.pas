@@ -12,9 +12,9 @@
     Non-blocking synchronization objects based on interlocked functions
     operating on locking flag(s).
 
-  ©František Milt 2016-02-18
+  ©František Milt 2018-10-21
 
-  Version 1.0 alpha (needs extensive testing)
+  Version 1.0.1 alpha (needs extensive testing)
 
   Notes:
     - provided synchronizers are non-blocking - acquire operation returns
@@ -68,8 +68,6 @@ unit FastLocks;
   {$MACRO ON}
 {$ENDIF}
 
-{$TYPEINFO ON}
-
 interface
 
 uses
@@ -99,7 +97,6 @@ type
     Function WaitOn(TimeOut: UInt32; WaitMethod: TFLWaitMethod; WaitSpin: Boolean = True; Reserve: TFLReserveMethod = nil; Unreserve: TFLReserveMethod = nil): TFLWaitResult; virtual;
   public
     constructor Create(WaitSpinCount: UInt32 = DefaultWaitSpinCount); virtual;
-  published
     property WaitSpinCount: UInt32 read fWaitSpinCount;
   end;
 
