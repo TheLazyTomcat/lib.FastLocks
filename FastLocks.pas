@@ -342,8 +342,8 @@ const
   FL_MREW_MAX_WRITE_RESERVE = 10000 {must be lower than $3FFF (16383)};
   FL_MREW_MAX_WRITE         = 8;    {must be lower than 16}
 
-  LF_MREW_SHIFT_WRITE_RESERVE = 14;
-  LF_MREW_SHIFT_WRITE         = 28;
+  FL_MREW_SHIFT_WRITE_RESERVE = 14;
+  FL_MREW_SHIFT_WRITE         = 28;
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -655,7 +655,7 @@ var
   OldFlagValue: Integer;
 begin
 OldFlagValue := InterlockedExchangeAdd(fMainFlag,FL_MREW_DELTA_WRITE);
-If (OldFlagValue shr LF_MREW_SHIFT_WRITE) <= FL_MREW_MAX_WRITE then
+If (OldFlagValue shr FL_MREW_SHIFT_WRITE) <= FL_MREW_MAX_WRITE then
   begin
     If Reserved then
       Result := OldFlagValue and not FL_MREW_MASK_WRITE_RESERVE = FL_UNLOCKED
@@ -681,9 +681,9 @@ var
   OldFlagValue: Integer;
 begin
 OldFlagValue := InterlockedExchangeAdd(fMainFlag,FL_MREW_DELTA_WRITE_RESERVE);
-If ((OldFlagValue and FL_MREW_MASK_WRITE_RESERVE) shr LF_MREW_SHIFT_WRITE_RESERVE) > FL_MREW_MAX_WRITE_RESERVE then
+If ((OldFlagValue and FL_MREW_MASK_WRITE_RESERVE) shr FL_MREW_SHIFT_WRITE_RESERVE) > FL_MREW_MAX_WRITE_RESERVE then
   raise EFLResevationError.CreateFmt('TFastMultiReadExclusiveWriteSynchronizer.ReserveWrite: Cannot reserve MREW for writing (%d).',
-                            [(OldFlagValue and FL_MREW_MASK_WRITE_RESERVE) shr LF_MREW_SHIFT_WRITE_RESERVE]);
+                            [(OldFlagValue and FL_MREW_MASK_WRITE_RESERVE) shr FL_MREW_SHIFT_WRITE_RESERVE]);
 end;
 
 //------------------------------------------------------------------------------
