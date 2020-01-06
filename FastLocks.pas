@@ -47,7 +47,7 @@
            |        CritSect.Leave;
            |      end
            |    else
-           |      begin           |
+           |      begin           
            |        <code_not_needing_sync>
            |        synchronization not possible, do other things that
            |        do not need to be synchronized
