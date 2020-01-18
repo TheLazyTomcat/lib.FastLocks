@@ -71,9 +71,9 @@
            --   <repeat_if_needed>
                 <unsynchronized_code>
 
-  Version 1.1 (2020-01-06)
+  Version 1.1.1 (2020-01-19)
 
-  Last change 2020-01-06
+  Last change 2020-01-19
 
   ©2016-2020 František Milt
 
@@ -160,9 +160,7 @@ type
   protected
     fMainFlag:      Integer;
     fWaitSpinCount: UInt32;
-  {$IFDEF Windows}
-    fPerfCntFreq:   Int64;
-  {$ENDIF}
+    fCounterFreq:   Int64;
     Function SpinOn(SpinCount: UInt32;
                     AcquireMethod: TFLAcquireMethod;
                     ReserveMethod: TFLReserveMethod = nil;
@@ -241,7 +239,7 @@ uses
 {$IFDEF Windows}
   Windows
 {$ELSE}
-  unixtype, linux
+  unixtype, baseunix, linux
 {$ENDIF};
 
 {$IFDEF FPC_DisableWarns}
@@ -284,10 +282,53 @@ asm
 end;
 {$ELSE}
 begin
-Result := {$IFDEF Windows}Windows.{$ELSE}{$IFDEF FPC}System.{$ELSE}SysUtils.{$ENDIF}{$ENDIF}
-          InterlockedExchangeAdd(A,B);
+{$IFDEF Windows}
+Result := Windows.InterlockedExchangeAdd(A,B);
+{$ELSE}
+{$IFDEF FPC}
+Result := System.InterlockedExchangeAdd(A,B);
+{$ELSE}
+Result := SysUtils.InterlockedExchangeAdd(A,B);
+{$ENDIF}
+{$ENDIF}
 end;
 {$ENDIF}
+
+//------------------------------------------------------------------------------
+
+Function GetCounterFrequency(out Freq: Int64): Boolean;
+{$IFNDEF Windows}
+var
+  Time: TTimeSpec;
+{$ENDIF}
+begin
+{$IFDEF Windows}
+Freq := 0;
+Result := QueryPerformanceFrequency(Freq);
+{$ELSE}
+Freq := 1000000000{ns};
+Result := clock_getres(CLOCK_MONOTONIC_RAW,@Time) = 0;
+{$ENDIF}
+Freq := Freq and Int64($7FFFFFFFFFFFFFFF);  // mask out bit 63
+end;
+
+//------------------------------------------------------------------------------
+
+Function GetCounterValue(out Count: Int64): Boolean;
+{$IFNDEF Windows}
+var
+  Time: TTimeSpec;
+{$ENDIF}
+begin
+{$IFDEF Windows}
+Count := 0;
+Result := QueryPerformanceCounter(Count);
+{$ELSE}
+Result := clock_gettime(CLOCK_MONOTONIC_RAW,@Time) = 0;
+Count := Int64(Time.tv_sec) * 1000000000 + Time.tv_nsec;
+{$ENDIF}
+Count := Count and Int64($7FFFFFFFFFFFFFFF);  // mask out bit 63
+end;
 
 {===============================================================================
     Imlementation constants
@@ -405,59 +446,24 @@ end;
 Function TFastLock.WaitOn(TimeOut: UInt32; AcquireMethod: TFLAcquireMethod; SpinBetweenWaits: Boolean = True;
   ReserveMethod: TFLReserveMethod = nil; UnreserveMethod: TFLReserveMethod = nil): TFLWaitResult;
 var
-{$IFDEF Windows}
   StartCount:       Int64;
-{$ELSE}
-  StartTime:        TTimeSpec;
-{$ENDIF}
   WaitSpinCntLocal: UInt32;
 
   //  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
 
   Function GetElapsedMillis: UInt32;
-{$IFDEF Windows}
-  // imnplementation for windows
   var
     CurrentCount: Int64;
   begin
-    If QueryPerformanceCounter(CurrentCount) then
+    If GetCounterValue(CurrentCount) then
       begin
         If CurrentCount < StartCount then
-          Result := ((High(Int64) - StartCount + CurrentCount) * 1000) div fPerfCntFreq
+          Result := ((High(Int64) - StartCount + CurrentCount) * 1000) div fCounterFreq
         else
-          Result := ((CurrentCount - StartCount) * 1000) div fPerfCntFreq;
+          Result := ((CurrentCount - StartCount) * 1000) div fCounterFreq;
       end
     else Result := UInt32(-1);
   end;
-{$ELSE}
-  // implementation for linux
-  var
-    CurrentTime:    TTimeSpec;
-    Secs,nSecs:     UInt64;
-  begin
-    If clock_gettime(CLOCK_MONOTONIC_RAW,@CurrentTime) = 0 then
-      begin
-        // get time differences for secs and nanosecs
-        If CurrentTime.tv_sec >= StartTime.tv_sec then
-          Secs := CurrentTime.tv_sec - StartTime.tv_sec
-        else
-          Secs := High(CurrentTime.tv_sec) - StartTime.tv_sec + CurrentTime.tv_sec;
-        If CurrentTime.tv_nsec < StartTime.tv_nsec then
-          begin
-            nSecs := 1000000000 - StartTime.tv_nsec + CurrentTime.tv_nsec;
-            Dec(Secs);
-          end
-        else nSecs := CurrentTime.tv_nsec - StartTime.tv_nsec;
-        // convert to milliseconds and put into result
-        If (Secs * 1000) <= High(Result) then
-          begin
-            Result := UInt32((Secs * 1000) + (nSecs) div 1000000);
-          end
-        else Result := UInt32(-1);
-      end
-    else Result := UInt32(-1);
-  end;
-{$ENDIF}
 
   //  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
 
@@ -486,11 +492,7 @@ If TimeOut = INFINITE then
   Result := SpinOn(INFINITE,AcquireMethod,ReserveMethod,UnreserveMethod)
 else
   begin
-  {$IFDEF Windows}
-    If QueryPerformanceCounter(StartCount) then
-  {$ELSE}
-    If clock_gettime(CLOCK_MONOTONIC_RAW,@StartTime) = 0 then
-  {$ENDIF}
+    If GetCounterValue(StartCount) then
       begin
         If Assigned(ReserveMethod) and Assigned(UnreserveMethod) then
           begin
@@ -521,10 +523,9 @@ If (PtrUInt(Addr(fMainFlag)) and 3) <> 0 then
 {$IFDEF FPCDWM}{$POP}{$ENDIF}
   raise EFLCreationError.CreateFmt('TFastLock.Create: Main flag address (0x%p) is not properly aligned.',[Addr(fMainFlag)]);
 fWaitSpinCount := WaitSpinCount;
-{$IFDEF Windows}
-If not QueryPerformanceFrequency(fPerfCntFreq) then
-  raise EFLCreationError.CreateFmt('TFastLock.Create: Cannot obtain performance counter frequency (0x%.8x).',[GetLastError]);
-{$ENDIF}
+If not GetCounterFrequency(fCounterFreq) then
+  raise EFLCreationError.CreateFmt('TFastLock.Create: Cannot obtain counter frequency (0x%.8x).',
+                                   [{$IFDEF Windows}GetLastError{$ELSE}errno{$ENDIF}]);
 end;
 
 
