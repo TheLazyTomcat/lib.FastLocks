@@ -246,7 +246,6 @@ uses
   {$DEFINE FPCDWM}
   {$DEFINE W4055:={$WARN 4055 OFF}} // Conversion between ordinals and pointers is not portable
   {$DEFINE W5024:={$WARN 5024 OFF}} // Parameter "$1" not used
-  {$DEFINE W5057:={$WARN 5057 OFF}} // Local variable "$1" does not seem to be initialized
 {$ENDIF}
 
 {$IFNDEF Windows}
@@ -442,7 +441,6 @@ end;
 
 //------------------------------------------------------------------------------
 
-{$IFDEF FPCDWM}{$PUSH}W5057{$ENDIF}
 Function TFastLock.WaitOn(TimeOut: UInt32; AcquireMethod: TFLAcquireMethod; SpinBetweenWaits: Boolean = True;
   ReserveMethod: TFLReserveMethod = nil; UnreserveMethod: TFLReserveMethod = nil): TFLWaitResult;
 var
@@ -508,7 +506,6 @@ else
     else Result := wrError;
   end;
 end;
-{$IFDEF FPCDWM}{$POP}{$ENDIF}
 
 {-------------------------------------------------------------------------------
     TFastLock - public methods
