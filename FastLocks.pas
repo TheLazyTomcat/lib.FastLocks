@@ -71,9 +71,9 @@
            --   <repeat_if_needed>
                 <unsynchronized_code>
 
-  Version 1.1.1 (2020-01-19)
+  Version 1.1.2 (2020-03-08)
 
-  Last change 2020-01-19
+  Last change 2020-03-08
 
   ©2016-2020 František Milt
 
@@ -97,6 +97,18 @@
 
 ===============================================================================}
 unit FastLocks;
+
+{
+  FastLocks_PurePascal
+
+  If you want to compile this unit without ASM, don't want to or cannot define
+  PurePascal for the entire project and at the same time you don't want to or
+  cannot make changes to this unit, define this symbol for the entire project
+  and this unit will be compiled in PurePascal mode.
+}
+{$IFDEF FastLocks_PurePascal}
+  {$DEFINE PurePascal}
+{$ENDIF}
 
 {$IF Defined(CPUX86_64) or Defined(CPUX64)}
   {$DEFINE x64}
