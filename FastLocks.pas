@@ -73,7 +73,7 @@
 
   Version 1.1.2 (2020-03-08)
 
-  Last change 2020-03-08
+  Last change 2020-08-02
 
   ©2016-2020 František Milt
 
@@ -134,6 +134,7 @@ unit FastLocks;
     {$ASMMODE Intel}
   {$ENDIF}
 {$ENDIF}
+{$H+}
 
 interface
 
