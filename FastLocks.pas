@@ -21,13 +21,13 @@
       - there is absolutely no deadlock prevention - be extremely carefull when
         trying to acquire synchronizer in more than one place in a single thread
         (trying to acquire synchronizer second time in the same thread will
-        fail, ith exception being MREW reading, which is given by concept of
+        fail, with exception being MREW reading, which is given by concept of
         multiple readers access)
       - use provided wait methods only when necessary - synchronizers are
         intended to be used as non blocking
-      - waiting is always active (spinning) - do not wait for prolonged time
-        intervals as it might starve other threads; use infinite waiting only
-        in extreme cases and only when really necessary
+      - waiting is by default active (spinning) - do not wait for prolonged
+        time intervals as it might starve other threads, use infinite waiting
+        only in extreme cases and only when really necessary
       - use synchronization by provided objects only on very short (in time,
         not code) routines - do not use to synchronize code that is executing
         longer than few milliseconds
@@ -71,11 +71,11 @@
            --   <repeat_if_needed>
                 <unsynchronized_code>
 
-  Version 1.1.2 (2020-03-08)
+  Version 1.2 (2021-04-27)
 
-  Last change 2020-08-02
+  Last change 2021-04-27
 
-  ©2016-2020 František Milt
+  ©2016-2021 František Milt
 
   Contacts:
     František Milt: frantisek.milt@gmail.com
@@ -127,7 +127,9 @@ unit FastLocks;
 {$IFEND}
 
 {$IFDEF FPC}
-  {$MODE Delphi}
+  {$MODE ObjFPC}
+  {$MODESWITCH DuplicateLocals+}
+  {$MODESWITCH ClassicProcVars+}
   {$DEFINE FPC_DisableWarns}
   {$MACRO ON}
   {$IFNDEF PurePascal}
@@ -143,12 +145,10 @@ uses
   AuxTypes, AuxClasses;
 
 type
-  // library specific exceptions
+  // library-specific exceptions
   EFLException = class(Exception);
 
-  EFLSystemError     = class(EFLException);
-  EFLCreationError   = class(EFLException);
-  EFLResevationError = class(EFLException);
+  EFLCreationError = class(EFLException);
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -159,11 +159,60 @@ type
 const
   FL_DEF_WAIT_SPIN_CNT = 1500; // around 100us (microseconds) on Intel C2D T7100 @1.8GHz
 
+{$IFNDEF Windows}
+  INFINITE = UInt32(-1);
+{$ENDIF}
+
 type
   TFLAcquireMethod = Function(Reserved: Boolean): Boolean of object;
-  TFLReserveMethod = procedure of object;
+
+  TFLReserveMethod   = Function: Boolean of object;  
+  TFLUnreserveMethod = procedure of object;
 
   TFLWaitResult = (wrAcquired,wrTimeOut,wrError);
+
+{
+  In waiting (methods WaitTo*), the function blocks by executing a cycle. Each
+  iteration of this cycle contains a try to acquire the lock, a check for
+  timeout and a delaying part that prevents rapid calls to acquire and timers.
+
+  TFLWaitDelayMethod enumeration is here to select a method used for this
+  delaying.
+
+    wdNone        No delaying action is performed.
+
+    wdSpin        A call to SpinOn is made with spin count set to a value
+                  stored in property WaitSpinCount.
+
+    wdYield       An attempt to yield execution of current thread is made.
+                  If system has another thread that can be run, the current
+                  thread is suspended, rescheduled and the next thread is run.
+                  If there is no thread awaiting execution, then the current
+                  thread is not suspended and continues execution and pretty
+                  much performs spinning.
+
+                    WARNING - use with caution, as it can cause spinning with
+                              rapid calls to thread yielding on uncontested CPU.
+
+    wdSleep       The current thread stops execution (call to Sleep) for no
+                  less than 10ms. Note that this time might actually be longer
+                  because of granularity of scheduling timers, resulting in
+                  slightly longer wait time than is requested.
+
+    wdSleepEx     Behaves the same as wdSleep, but the thread can be awakened
+                  by APC or I/O completion calls.
+
+                    NOTE - works only on Windows, everywhere else it behaves
+                           the same as wdSleep.
+
+    wdYieldSleep  Combination od wdYield and wdSleep - when the thread is not
+                  yielded (eg. because no thread is waiting execution), a sleep
+                  is performed.
+
+                    NOTE - works only on Windows, everywhere else it behaves
+                           the same as wdSleep.
+}
+  TFLWaitDelayMethod = (wdNone,wdSpin,wdYield,wdSleep,wdSleepEx,wdYieldSleep);
 
 {===============================================================================
     TFastLock - class declaration
@@ -171,21 +220,23 @@ type
 
   TFastLock = class(TCustomObject)
   protected
-    fMainFlag:      Integer;
-    fWaitSpinCount: UInt32;
+    fMainFlag:      Int32;
     fCounterFreq:   Int64;
+    fWaitSpinCount: UInt32;
+    Function GetWaitSpinCount: UInt32; virtual;
+    procedure SetWaitSpinCount(Value: UInt32); virtual;
     Function SpinOn(SpinCount: UInt32;
                     AcquireMethod: TFLAcquireMethod;
-                    ReserveMethod: TFLReserveMethod = nil;
-                    UnreserveMethod: TFLReserveMethod = nil): TFLWaitResult; virtual;
+                    ReserveMethod: TFLReserveMethod;
+                    UnreserveMethod: TFLUnreserveMethod): TFLWaitResult; virtual;
     Function WaitOn(TimeOut: UInt32;
                     AcquireMethod: TFLAcquireMethod;
-                    SpinBetweenWaits: Boolean = True;
-                    ReserveMethod: TFLReserveMethod = nil;
-                    UnreserveMethod: TFLReserveMethod = nil): TFLWaitResult; virtual;
+                    WaitDelayMethod: TFLWaitDelayMethod;
+                    ReserveMethod: TFLReserveMethod;
+                    UnreserveMethod: TFLUnreserveMethod): TFLWaitResult; virtual;
   public
     constructor Create(WaitSpinCount: UInt32 = FL_DEF_WAIT_SPIN_CNT); virtual;
-    property WaitSpinCount: UInt32 read fWaitSpinCount write fWaitSpinCount;
+    property WaitSpinCount: UInt32 read GetWaitSpinCount write SetWaitSpinCount;
   end;
 
 {===============================================================================
@@ -201,18 +252,18 @@ type
   protected
   {
     Reserved indicates that the synchronizer was reserved before a try to
-    acquire was made and that the synchronizer can acquire when reservation is
-    marked in the flags.
+    acquire was made and that the synchronizer can acquire even when
+    reservation is marked in the flags.
   }
     Function Acquire(Reserved: Boolean): Boolean; virtual;
     procedure Release; virtual;
-    procedure Reserve; virtual;
+    Function Reserve: Boolean; virtual;
     procedure Unreserve; virtual;
   public
     Function Enter: Boolean; virtual;
     procedure Leave; virtual;
     Function SpinToEnter(SpinCount: UInt32; Reserve: Boolean = True): TFLWaitResult; virtual;
-    Function WaitToEnter(Timeout: UInt32; SpinBetweenWaits: Boolean = True; Reserve: Boolean = True): TFLWaitResult; virtual;
+    Function WaitToEnter(Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin; Reserve: Boolean = True): TFLWaitResult; virtual;
   end;
 
 {===============================================================================
@@ -230,7 +281,7 @@ type
     procedure ReleaseRead; virtual;
     Function AcquireWrite(Reserved: Boolean): Boolean; virtual;
     procedure ReleaseWrite; virtual;
-    procedure ReserveWrite; virtual;
+    Function ReserveWrite: Boolean; virtual;
     procedure UnreserveWrite; virtual;
   public
     Function BeginRead: Boolean; virtual;
@@ -238,9 +289,9 @@ type
     Function BeginWrite: Boolean; virtual;
     procedure EndWrite; virtual;
     Function SpinToRead(SpinCount: UInt32): TFLWaitResult; virtual;
-    Function WaitToRead(Timeout: UInt32; SpinBetweenWaits: Boolean = True): TFLWaitResult; virtual;
+    Function WaitToRead(Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin): TFLWaitResult; virtual;
     Function SpinToWrite(SpinCount: UInt32; Reserve: Boolean = True): TFLWaitResult; virtual;
-    Function WaitToWrite(Timeout: UInt32; SpinBetweenWaits: Boolean = True; Reserve: Boolean = True): TFLWaitResult; virtual;
+    Function WaitToWrite(Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin; Reserve: Boolean = True): TFLWaitResult; virtual;
   end;
 
   // shorter name alias
@@ -261,36 +312,18 @@ uses
   {$DEFINE W5024:={$WARN 5024 OFF}} // Parameter "$1" not used
 {$ENDIF}
 
-{$IFNDEF Windows}
-const
-  INFINITE = UInt32(-1);
-{$ENDIF}
-
 {===============================================================================
     Auxiliary functions
 ===============================================================================}
-
 {
-  InterlockedExchangeAdd is implemented here, so there is no need to call it
-  from other unit - this is true mainly on windows, where a call to system
-  function residing in DLL would be made.
+  InterlockedExchangeAdd and InterlockedExchange are implemented here, so there
+  is no need to call then from elsewhere - this is true mainly on windows,
+  where a call to system function residing in a DLL would be made.
 } 
 Function InterlockedExchangeAdd(var A: Int32; B: Int32): Int32; {$IFNDEF PurePascal}register; assembler;
 asm
-{$IFDEF x64}
-  {$IFDEF Windows}
-        XCHG  RCX,  RDX
-  LOCK  XADD  dword ptr [RDX], ECX
-        MOV   EAX,  ECX
-  {$ELSE}
-        XCHG  RDI,  RSI
-  LOCK  XADD  dword ptr [RSI], EDI
-        MOV   EAX,  EDI
-  {$ENDIF}
-{$ELSE}
-        XCHG  EAX,  EDX
-  LOCK  XADD  dword ptr [EDX], EAX
-{$ENDIF}
+    LOCK  XADD  dword ptr [A], B
+          MOV   EAX, B
 end;
 {$ELSE}
 begin
@@ -301,6 +334,27 @@ Result := Windows.InterlockedExchangeAdd(A,B);
 Result := System.InterlockedExchangeAdd(A,B);
 {$ELSE}
 Result := SysUtils.InterlockedExchangeAdd(A,B);
+{$ENDIF}
+{$ENDIF}
+end;
+{$ENDIF}
+
+//------------------------------------------------------------------------------
+
+Function InterlockedExchange(var A: Int32; B: Int32): Int32; {$IFNDEF PurePascal}register; assembler;
+asm
+    LOCK  XCHG  dword ptr [A], B
+          MOV   EAX, B
+end;
+{$ELSE}
+begin
+{$IFDEF Windows}
+Result := Windows.InterlockedExchange(A,B);
+{$ELSE}
+{$IFDEF FPC}
+Result := System.InterlockedExchange(A,B);
+{$ELSE}
+Result := SysUtils.InterlockedExchange(A,B);
 {$ENDIF}
 {$ENDIF}
 end;
@@ -342,6 +396,31 @@ Count := Int64(Time.tv_sec) * 1000000000 + Time.tv_nsec;
 Count := Count and Int64($7FFFFFFFFFFFFFFF);  // mask out bit 63
 end;
 
+//------------------------------------------------------------------------------
+
+{$IFDEF Windows}
+{$IF not Declared(SwitchToThread)}
+Function SwitchToThread: BOOL; stdcall; external kernel32;
+{$IFEND}
+{$ELSE}
+{
+  FPC declares sched_yield as procedure without result, which afaik does not
+  correspond to linux man.
+}
+Function sched_yield: cint; cdecl; external;
+{$ENDIF}
+
+//------------------------------------------------------------------------------
+
+Function YieldThread: Boolean;
+begin
+{$IFDEF Windows}
+Result := SwitchToThread;
+{$ELSE}
+Result := sched_yield = 0;
+{$ENDIF}
+end;
+
 {===============================================================================
     Imlementation constants
 ===============================================================================}
@@ -354,28 +433,30 @@ const
 
     bit 0..7  - acquire count
     bit 8..27 - reserve count
-
+}
+{
   FL_CS_MAX_ACQUIRE
 
-    if acquire count is found to be above this value during acquiring, the
+    If acquire count is found to be above this value during acquiring, the
     acquire automatically fails without any further checks (it is to prevent
-    acquire count to overflow into reservation count)
+    acquire count to overflow into reservation count).
 
-  FL_CS_MASK_RESERVE
-
-    maximum number of reservations, if reservation count is found to be above
-    this value during reservation, an EFLResevationError exception is raised
 }
-  FL_CS_DELTA_ACQUIRE = 1;
-  FL_CS_DELTA_RESERVE = $100;
+  FL_CS_ACQUIRE_DELTA = 1;
+  FL_CS_ACQUIRE_MASK  = Int32($000000FF);
+  FL_CS_ACQUIRE_MAX   = 150;   {must be lower than $FF (255)}
 
-  FL_CS_MASK_ACQUIRE = Integer($000000FF);
-  FL_CS_MASK_RESERVE = Integer($0FFFFF00);
+{
+  FL_CS_MAX_RESERVE
 
-  FL_CS_MAX_ACQUIRE = 200;   {must be lower than $FF (255)}
-  FL_CS_MAX_RESERVE = 750000 {must be lower than $FFFFF (1048575)};
-
-  FL_CS_SHIFT_RESERVE = 8;
+    Maximum number of reservations, if reservation count is found to be above
+    this value, the reservation fails and consequently the wait function will
+    return an error.
+}
+  FL_CS_RESERVE_DELTA = $100;
+  FL_CS_RESERVE_MASK  = Int32($0FFFFF00);
+  FL_CS_RESERVE_MAX   = 750000 {must be lower than $FFFFF (1048575)};
+  FL_CS_RESERVE_SHIFT = 8;
 
 //------------------------------------------------------------------------------
 {
@@ -385,18 +466,18 @@ const
     bit 14..27  - write reservation count
     bit 28..31  - write count
 }
-  FL_MREW_DELTA_READ          = 1;
-  FL_MREW_DELTA_WRITE_RESERVE = Integer($4000);
-  FL_MREW_DELTA_WRITE         = Integer($10000000);
+  FL_MREW_READ_DELTA = 1;
+  FL_MREW_READ_MAX   = 10000 {must be lower than $3FFF (16383)};
 
-  FL_MREW_MASK_WRITE_RESERVE = Integer($0FFFC000);
+  FL_MREW_RESERVE_DELTA = Int32($4000);
+  FL_MREW_RESERVE_MASK  = Int32($0FFFC000);
+  FL_MREW_RESERVE_MAX   = 10000 {must be lower than $3FFF (16383)};
+  FL_MREW_RESERVE_SHIFT = 14;
 
-  FL_MREW_MAX_READ          = 10000 {must be lower than $3FFF (16383)};
-  FL_MREW_MAX_WRITE_RESERVE = 10000 {must be lower than $3FFF (16383)};
-  FL_MREW_MAX_WRITE         = 8;    {must be lower than 16}
-
-  FL_MREW_SHIFT_WRITE_RESERVE = 14;
-  FL_MREW_SHIFT_WRITE         = 28;
+  FL_MREW_WRITE_DELTA = Int32($10000000);
+  FL_MREW_WRITE_MAX   = 8;    {must be lower than 16}
+  FL_MREW_WRITE_SHIFT = 28;
+  
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -410,8 +491,22 @@ const
     TFastLock - protected methods
 -------------------------------------------------------------------------------}
 
+Function TFastLock.GetWaitSpinCount: UInt32;
+begin
+Result := InterlockedExchangeAdd(Integer(fWaitSpinCount),0);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TFastLock.SetWaitSpinCount(Value: UInt32);
+begin
+InterlockedExchange(Integer(fWaitSpinCount),Integer(Value));
+end;
+
+//------------------------------------------------------------------------------
+
 Function TFastLock.SpinOn(SpinCount: UInt32; AcquireMethod: TFLAcquireMethod;
-  ReserveMethod: TFLReserveMethod = nil; UnreserveMethod: TFLReserveMethod = nil): TFLWaitResult;
+  ReserveMethod: TFLReserveMethod; UnreserveMethod: TFLUnreserveMethod): TFLWaitResult;
 
   Function Spin: Boolean;
   begin
@@ -420,7 +515,7 @@ Function TFastLock.SpinOn(SpinCount: UInt32; AcquireMethod: TFLAcquireMethod;
     Result := SpinCount > 0;
   end;
 
-  //  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
 
   Function InternalSpin(Reserved: Boolean): TFLWaitResult;
   begin
@@ -433,18 +528,19 @@ Function TFastLock.SpinOn(SpinCount: UInt32; AcquireMethod: TFLAcquireMethod;
     Result := wrAcquired;
   end;
 
-    //  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
 
 begin
 try
   If Assigned(ReserveMethod) and Assigned(UnreserveMethod) then
     begin
-      ReserveMethod;
-      try
-        Result := InternalSpin(True);
-      finally
-        UnreserveMethod;
-      end;
+      If ReserveMethod then
+        try
+          Result := InternalSpin(True);
+        finally
+          UnreserveMethod;
+        end
+      else Result := wrError;
     end
   else Result := InternalSpin(False);
 except
@@ -454,13 +550,13 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TFastLock.WaitOn(TimeOut: UInt32; AcquireMethod: TFLAcquireMethod; SpinBetweenWaits: Boolean = True;
-  ReserveMethod: TFLReserveMethod = nil; UnreserveMethod: TFLReserveMethod = nil): TFLWaitResult;
+Function TFastLock.WaitOn(TimeOut: UInt32; AcquireMethod: TFLAcquireMethod; WaitDelayMethod: TFLWaitDelayMethod;
+  ReserveMethod: TFLReserveMethod; UnreserveMethod: TFLUnreserveMethod): TFLWaitResult;
 var
   StartCount:       Int64;
   WaitSpinCntLocal: UInt32;
 
-  //  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
 
   Function GetElapsedMillis: UInt32;
   var
@@ -476,48 +572,57 @@ var
     else Result := UInt32(-1);
   end;
 
-  //  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
 
   Function InternalWait(Reserved: Boolean): TFLWaitResult;
   begin
     while not AcquireMethod(Reserved) do
-      If GetElapsedMillis >= TimeOut then
+      If (TimeOut <> INFINITE) and (GetElapsedMillis >= TimeOut) then
         begin
           Result := wrTimeout;
           Exit;
         end
       else
         begin
-          If SpinBetweenWaits then
-            If SpinOn(WaitSpinCntLocal,AcquireMethod,nil,nil) = wrAcquired then
-              Break{while};
+          case WaitDelayMethod of
+            wdNone:;      // do nothing;
+            wdSpin:       If SpinOn(WaitSpinCntLocal,AcquireMethod,nil,nil) = wrAcquired then
+                            Break{while};
+            wdYield:      YieldThread;
+          {$IFDEF Windows}
+            wdSleep:      Sleep(10);
+            wdSleepEx:    SleepEx(10,True);
+            wdYieldSleep: If not YieldThread then
+                            Sleep(10);
+          {$ELSE}
+            wdSleep,
+            wdSleepEx,
+            wdYieldSleep: Sleep(10);
+          {$ENDIF}
+          end
         end;
     Result := wrAcquired;
   end;
 
-  //  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
 
 begin
-WaitSpinCntLocal := fWaitSpinCount;
-If TimeOut = INFINITE then
-  Result := SpinOn(INFINITE,AcquireMethod,ReserveMethod,UnreserveMethod)
-else
+WaitSpinCntLocal := GetWaitSpinCount;
+If GetCounterValue(StartCount) then
   begin
-    If GetCounterValue(StartCount) then
+    If Assigned(ReserveMethod) and Assigned(UnreserveMethod) then
       begin
-        If Assigned(ReserveMethod) and Assigned(UnreserveMethod) then
-          begin
-            ReserveMethod;
-            try
-              Result := InternalWait(True);
-            finally
-              UnreserveMethod;
-            end;
+        If ReserveMethod then
+          try
+            Result := InternalWait(True);
+          finally
+            UnreserveMethod;
           end
-        else Result := InternalWait(False);
+        else Result := wrError;
       end
-    else Result := wrError;
-  end;
+    else Result := InternalWait(False);
+  end
+else Result := wrError;
 end;
 
 {-------------------------------------------------------------------------------
@@ -528,14 +633,10 @@ constructor TFastLock.Create(WaitSpinCount: UInt32 = FL_DEF_WAIT_SPIN_CNT);
 begin
 inherited Create;
 fMainFlag := FL_UNLOCKED;
-{$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
-If (PtrUInt(Addr(fMainFlag)) and 3) <> 0 then
-{$IFDEF FPCDWM}{$POP}{$ENDIF}
-  raise EFLCreationError.CreateFmt('TFastLock.Create: Main flag address (0x%p) is not properly aligned.',[Addr(fMainFlag)]);
-fWaitSpinCount := WaitSpinCount;
 If not GetCounterFrequency(fCounterFreq) then
   raise EFLCreationError.CreateFmt('TFastLock.Create: Cannot obtain counter frequency (0x%.8x).',
                                    [{$IFDEF Windows}GetLastError{$ELSE}errno{$ENDIF}]);
+SetWaitSpinCount(WaitSpinCount);
 end;
 
 
@@ -555,43 +656,43 @@ Function TFastCriticalSection.Acquire(Reserved: Boolean): Boolean;
 var
   OldFlagValue: Integer;
 begin
-OldFlagValue := InterlockedExchangeAdd(fMainFlag,FL_CS_DELTA_ACQUIRE);
-If (OldFlagValue and FL_CS_MASK_ACQUIRE) <= FL_CS_MAX_ACQUIRE then
+OldFlagValue := InterlockedExchangeAdd(fMainFlag,FL_CS_ACQUIRE_DELTA);
+If (OldFlagValue and FL_CS_ACQUIRE_MASK) < FL_CS_ACQUIRE_MAX then
   begin
     If Reserved then
-      Result := (OldFlagValue and FL_CS_MASK_ACQUIRE) = FL_UNLOCKED
+      Result := (OldFlagValue and not FL_CS_RESERVE_MASK) = FL_UNLOCKED
     else
       Result := OldFlagValue = FL_UNLOCKED;
   end
 else Result := False;
 If not Result then
-  InterlockedExchangeAdd(fMainFlag,-FL_CS_DELTA_ACQUIRE);
+  InterlockedExchangeAdd(fMainFlag,-FL_CS_ACQUIRE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
 
 procedure TFastCriticalSection.Release;
 begin
-InterlockedExchangeAdd(fMainFlag,-FL_CS_DELTA_ACQUIRE);
+InterlockedExchangeAdd(fMainFlag,-FL_CS_ACQUIRE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TFastCriticalSection.Reserve;
+Function TFastCriticalSection.Reserve: Boolean;
 var
   OldFlagValue: Integer;
 begin
-OldFlagValue := InterlockedExchangeAdd(fMainFlag,FL_CS_DELTA_RESERVE);
-If ((OldFlagValue and FL_CS_MASK_RESERVE) shr FL_CS_SHIFT_RESERVE) > FL_CS_MAX_RESERVE then
-  raise EFLResevationError.CreateFmt('TFastCriticalSection.Reserve: Cannot reserve critical section (%d).',
-                            [(OldFlagValue and FL_CS_MASK_RESERVE) shr FL_CS_SHIFT_RESERVE]);
+OldFlagValue := InterlockedExchangeAdd(fMainFlag,FL_CS_RESERVE_DELTA);
+Result := ((OldFlagValue and FL_CS_RESERVE_MASK) shr FL_CS_RESERVE_SHIFT) < FL_CS_RESERVE_MAX;
+If not Result then
+  InterlockedExchangeAdd(fMainFlag,-FL_CS_RESERVE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
 
 procedure TFastCriticalSection.Unreserve;
 begin
-InterlockedExchangeAdd(fMainFlag,-FL_CS_DELTA_RESERVE);
+InterlockedExchangeAdd(fMainFlag,-FL_CS_RESERVE_DELTA);
 end;
 
 {-------------------------------------------------------------------------------
@@ -622,12 +723,12 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TFastCriticalSection.WaitToEnter(Timeout: UInt32; SpinBetweenWaits: Boolean = True; Reserve: Boolean = True): TFLWaitResult;
+Function TFastCriticalSection.WaitToEnter(Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin; Reserve: Boolean = True): TFLWaitResult;
 begin
 If Reserve then
-  Result := WaitOn(Timeout,Self.Acquire,SpinBetweenWaits,Self.Reserve,Self.Unreserve)
+  Result := WaitOn(Timeout,Self.Acquire,WaitDelayMethod,Self.Reserve,Self.Unreserve)
 else
-  Result := WaitOn(Timeout,Self.Acquire,SpinBetweenWaits,nil,nil);
+  Result := WaitOn(Timeout,Self.Acquire,WaitDelayMethod,nil,nil);
 end;
 
 
@@ -646,9 +747,9 @@ end;
 {$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
 Function TFastMultiReadExclusiveWriteSynchronizer.AcquireRead(Reserved: Boolean): Boolean;
 begin
-Result := InterlockedExchangeAdd(fMainFlag,FL_MREW_DELTA_READ) <= FL_MREW_MAX_READ;
+Result := InterlockedExchangeAdd(fMainFlag,FL_MREW_READ_DELTA) < FL_MREW_READ_MAX;
 If not Result then
-  InterlockedExchangeAdd(fMainFlag,-FL_MREW_DELTA_READ);
+  InterlockedExchangeAdd(fMainFlag,-FL_MREW_READ_DELTA);
 end;
 {$IFDEF FPCDWM}{$POP}{$ENDIF}
 
@@ -656,7 +757,7 @@ end;
 
 procedure TFastMultiReadExclusiveWriteSynchronizer.ReleaseRead;
 begin
-InterlockedExchangeAdd(fMainFlag,-FL_MREW_DELTA_READ);
+InterlockedExchangeAdd(fMainFlag,-FL_MREW_READ_DELTA);
 end;
 
 //------------------------------------------------------------------------------
@@ -665,43 +766,43 @@ Function TFastMultiReadExclusiveWriteSynchronizer.AcquireWrite(Reserved: Boolean
 var
   OldFlagValue: Integer;
 begin
-OldFlagValue := InterlockedExchangeAdd(fMainFlag,FL_MREW_DELTA_WRITE);
-If (OldFlagValue shr FL_MREW_SHIFT_WRITE) <= FL_MREW_MAX_WRITE then
+OldFlagValue := InterlockedExchangeAdd(fMainFlag,FL_MREW_WRITE_DELTA);
+If (OldFlagValue shr FL_MREW_WRITE_SHIFT) < FL_MREW_WRITE_MAX then
   begin
     If Reserved then
-      Result := OldFlagValue and not FL_MREW_MASK_WRITE_RESERVE = FL_UNLOCKED
+      Result := (OldFlagValue and not FL_MREW_RESERVE_MASK) = FL_UNLOCKED
     else
       Result := OldFlagValue = FL_UNLOCKED;
   end
 else Result := False;
 If not Result then
-  InterlockedExchangeAdd(fMainFlag,-FL_MREW_DELTA_WRITE);
+  InterlockedExchangeAdd(fMainFlag,-FL_MREW_WRITE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
 
 procedure TFastMultiReadExclusiveWriteSynchronizer.ReleaseWrite;
 begin
-InterlockedExchangeAdd(fMainFlag,-FL_MREW_DELTA_WRITE)
+InterlockedExchangeAdd(fMainFlag,-FL_MREW_WRITE_DELTA)
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TFastMultiReadExclusiveWriteSynchronizer.ReserveWrite;
+Function TFastMultiReadExclusiveWriteSynchronizer.ReserveWrite: Boolean;
 var
   OldFlagValue: Integer;
 begin
-OldFlagValue := InterlockedExchangeAdd(fMainFlag,FL_MREW_DELTA_WRITE_RESERVE);
-If ((OldFlagValue and FL_MREW_MASK_WRITE_RESERVE) shr FL_MREW_SHIFT_WRITE_RESERVE) > FL_MREW_MAX_WRITE_RESERVE then
-  raise EFLResevationError.CreateFmt('TFastMultiReadExclusiveWriteSynchronizer.ReserveWrite: Cannot reserve MREW for writing (%d).',
-                            [(OldFlagValue and FL_MREW_MASK_WRITE_RESERVE) shr FL_MREW_SHIFT_WRITE_RESERVE]);
+OldFlagValue := InterlockedExchangeAdd(fMainFlag,FL_MREW_RESERVE_DELTA);
+Result := ((OldFlagValue and FL_MREW_RESERVE_MASK) shr FL_MREW_RESERVE_SHIFT) < FL_MREW_RESERVE_MAX;
+If not Result then
+  InterlockedExchangeAdd(fMainFlag,-FL_MREW_RESERVE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
 
 procedure TFastMultiReadExclusiveWriteSynchronizer.UnreserveWrite;
 begin
-InterlockedExchangeAdd(fMainFlag,-FL_MREW_DELTA_WRITE_RESERVE);
+InterlockedExchangeAdd(fMainFlag,-FL_MREW_RESERVE_DELTA);
 end;
 
 {-------------------------------------------------------------------------------
@@ -743,9 +844,9 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TFastMultiReadExclusiveWriteSynchronizer.WaitToRead(Timeout: UInt32; SpinBetweenWaits: Boolean = True): TFLWaitResult;
+Function TFastMultiReadExclusiveWriteSynchronizer.WaitToRead(Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin): TFLWaitResult;
 begin
-Result := WaitOn(Timeout,Self.AcquireRead,SpinBetweenWaits,nil,nil);
+Result := WaitOn(Timeout,Self.AcquireRead,WaitDelayMethod,nil,nil);
 end;
 
 //------------------------------------------------------------------------------
@@ -760,12 +861,12 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TFastMultiReadExclusiveWriteSynchronizer.WaitToWrite(Timeout: UInt32; SpinBetweenWaits: Boolean = True; Reserve: Boolean = True): TFLWaitResult;
+Function TFastMultiReadExclusiveWriteSynchronizer.WaitToWrite(Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin; Reserve: Boolean = True): TFLWaitResult;
 begin
 If Reserve then
-  Result := WaitOn(Timeout,Self.AcquireWrite,SpinBetweenWaits,Self.ReserveWrite,Self.UnreserveWrite)
+  Result := WaitOn(Timeout,Self.AcquireWrite,WaitDelayMethod,Self.ReserveWrite,Self.UnreserveWrite)
 else
-  Result := WaitOn(Timeout,Self.AcquireWrite,SpinBetweenWaits,nil,nil);
+  Result := WaitOn(Timeout,Self.AcquireWrite,WaitDelayMethod,nil,nil);
 end;
 
 end.
