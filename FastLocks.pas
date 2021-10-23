@@ -9,36 +9,67 @@
 
   FastLocks
 
-    Non-blocking synchronization objects based on interlocked functions
-    operating on locking flag(s).
+    Simple non-blocking synchronization objects based on interlocked functions
+    operating on locking flags and counters.
 
-    Notes:
-      - none of the provided synchronizer is robust or recursive
-      - provided synchronizers are non-blocking - acquire operation returns
-        immediatelly and its result signals whether the synchronizer was
-        acquired (True) or not (False)
-      - as for all synchronizers, create one instace and pass it to all threads
-        that need to use it (remember to free it only once)  
-      - there is absolutely no deadlock prevention - be extremely carefull when
-        trying to acquire synchronizer in more than one place in a single thread
-        (trying to acquire synchronizer second time in the same thread will
-        fail, with exception being MREW reading, which is given by concept of
-        multiple readers access)
-      - use provided wait methods only when necessary - synchronizers are
-        intended to be used as non blocking
-      - waiting is by default active (spinning) - do not wait for prolonged
-        time intervals as it might starve other threads, use infinite waiting
-        only in extreme cases and only when really necessary
-      - use synchronization by provided objects only on very short (in time,
-        not code) routines - do not use to synchronize code that is executing
-        longer than few milliseconds
-      - every successfull acquire of a synchronizer MUST be paired by a release,
-        synhronizers are not automalically released
-      - if synchronization flags are marked as reserved, then only synchronizers
-        that are trying to acquire with reservation can acquire them, no
-        synchronizer can acquire them if it is called withour reservation
+    WARNING >>>
 
-    Example on how to properly use non-blocking character of provided objects:
+      This library was written for a specific scenario, where there was tens
+      of thousand of separate data structures, each of which could have been
+      accessed by several threads, and where concurrent access was rare but
+      very possible and dangerous. When a simultaneous access occured, it was
+      almost always reading.
+
+      Creating RW lock for each of the structure was unfeasible, so this
+      library was written to provide some light-weight locking mechanism with
+      minimal memory and OS resources footprint. Implementation is therefore
+      maximally simple, which causes many limitations.
+
+    <<< WARNING
+
+    Non-blocking behaviour means that any attempt to acquire lock will return
+    immediatelly, and resulting value of this attempt indicates whether the
+    lock was really acquired or not.
+
+    At this point, only two synchronization primitives/objects are implenented,
+    critical section and an RW lock (multiple-read exclusive-write
+    synchronizer). More might be added later, but currently it is unlikely.
+    For details about how any of the object works and what are its limitation,
+    refer to its declaration.
+
+    In its basic form, each in-here implemented synchronizer is just an integer
+    residing in the memory. Within this library, this integer is called flag
+    word.
+    It is used to store the locking flags and/or counters and interlocked
+    functions are used to atomically change and probe stored values and to
+    decide state of the object and required action.
+
+      WARNING - all implemented synchronizers are operating on the same flag
+                word type (TFLFlagWord), but they are not mutually compatible.
+                So always use one flag word for only one type of synchronizer,
+                newer mix them on one variable.
+
+    All synchronizers can be used either directly, where you allocate a variable
+    of type TFLFlagWord and then operate on it using interface functions (eg.
+    FastCriticalSectionReserve, FastMREWBeginRead, ...), or indirectly,
+    by creating an instance of provided class and using its methods.
+
+    When creating the class instance, you can either provide preallocated flag
+    word variable or leave its complete management on the instance itself.
+    This gives you more freedom in deciding how to use the sychnonization - you
+    can either allocate common flag word and create new instance for each
+    syhcnronizing thread, or you can create one common instance and us >it< in
+    all threads.
+
+      NOTE - if the flag vord variable is located in a shared memory, the
+             synchronizers can then be used for inter-process synchronization.
+
+    One advantage of instance approach is that they provide a mechanism for
+    waiting - ie. they block until the lock is acquired or timeout elapses.
+    But note that this waiting is always active (spinning), and therefore
+    should be used only rarely and carefully.
+
+    Here is a small example how a non-blocking synchronization can be used:
 
                 <unsynchronized_code>
            -->  If CritSect.Enter then
@@ -72,9 +103,37 @@
            --   <repeat_if_needed>
                 <unsynchronized_code>
 
-  Version 1.3 (2021-04-27)
+    Some more iportant notes on the implementation and use:
 
-  Last change 2021-04-27
+      - none of the provided synchronizers is robust (when a thread holding
+        a lock ends without releasing it, it will stay locked indefinitely)
+
+      - none of the provided synchronizers is recursive (when attempting to
+        acquire a lock second time in the same thread, it will always fail)
+
+      - there is absolutely no deadlock prevention - be extremely carefull when
+        trying to acquire synchronizer in more than one place in a single thread
+        (trying to acquire synchronizer second time in the same thread will
+        always fail, with exception being MREW reading, which is given by
+        concept of multiple readers access)
+
+      - use provided wait methods only when necessary - synchronizers are
+        intended to be used as non-blocking
+
+      - waiting is always active (spinning) - do not wait for prolonged time
+        intervals as it might starve other threads, use infinite waiting only
+        in extreme cases and only when really necessary
+
+      - use synchronization by provided objects only on very short (in time,
+        not code) routines - do not use to synchronize code that is executing
+        longer than few milliseconds
+
+      - every successfull acquire of a synchronizer MUST be paired by a release,
+        synhronizers are not automalically released
+
+  Version 1.3 (2021-10-23)
+
+  Last change 2021-10-23
 
   ©2016-2021 František Milt
 
@@ -102,26 +161,6 @@
 
 ===============================================================================}
 unit FastLocks;
-
-{
-  FastLocks_PurePascal
-
-  If you want to compile this unit without ASM, don't want to or cannot define
-  PurePascal for the entire project and at the same time you don't want to or
-  cannot make changes to this unit, define this symbol for the entire project
-  and this unit will be compiled in PurePascal mode.
-}
-{$IFDEF FastLocks_PurePascal}
-  {$DEFINE PurePascal}
-{$ENDIF}{$message 'remove PurePascal?'}
-
-{$IF Defined(CPUX86_64) or Defined(CPUX64)}
-  {$DEFINE x64}
-{$ELSEIF Defined(CPU386)}
-  {$DEFINE x86}
-{$ELSE}
-  {$DEFINE PurePascal}
-{$IFEND}
 
 {$IF Defined(WINDOWS) or Defined(MSWINDOWS)}
   {$DEFINE Windows}
@@ -151,6 +190,18 @@ unit FastLocks;
 {$ENDIF}
 {$H+}
 
+//------------------------------------------------------------------------------
+{
+  FlagWord64
+
+  When this symbol is defined, the type used for flag words (TFLFlagWord), and
+  therefore the flag words themselves, is 64 bits wide, otherwise it is 32 bits
+  wide.
+
+  This holds true on all systems.
+
+  By default defined.
+}
 {$DEFINE FlagWord64}
 
 interface
@@ -159,8 +210,10 @@ uses
   SysUtils,
   AuxTypes, AuxClasses;
 
+{===============================================================================
+    Library-specific exceptions
+===============================================================================}
 type
-  // library-specific exceptions
   EFLException = class(Exception);
 
   EFLCreationError = class(EFLException);
@@ -182,10 +235,24 @@ type
   TFLFlagWord = {$IFDEF FlagWord64}UInt64{$ELSE}UInt32{$ENDIF};
   PFLFlagWord = ^TFLFlagWord;
 
+{
+  Returned as a result of spinning or waiting (methods SpinTo* and WaitTo*).
+  Informs whether a required access to the synchronizer was granted and if not,
+  for what reason.
+
+    wrAcquired - requested access was granted and the object is now locked
+
+    wrTimeOut  - spinning/waiting timed-out, ie. access was not granted in
+                 given timeout period
+
+    wrReserved - spinning/waiting failed and the acces was not granted because
+                 the synchronizer was reserved or a maximum reservation count
+                 was reached
+
+    wrError    - an error has ocurred
+}
   TFLWaitResult = (wrAcquired,wrTimeOut,wrReserved,wrError);
 
-  TFLAcquireMethod = Function(Reserved: Boolean): Boolean of object;
-  
 {
   In waiting (methods WaitTo*), the function blocks by executing a cycle. Each
   iteration of this cycle contains a try to acquire the lock, a check for
@@ -229,9 +296,13 @@ type
 }
   TFLWaitDelayMethod = (wdNone,wdSpin,wdYield,wdSleep,wdSleepEx,wdYieldSleep);
 
+  // TFLAcquireMethod is only for internal use, but must be public
+  TFLAcquireMethod = Function(Reserved: Boolean): Boolean of object;
+
 {===============================================================================
     TFastLock - class declaration
 ===============================================================================}
+{$message 'add description of spinning/waiting'}
 type
   TFastLock = class(TCustomObject)
   protected
@@ -264,9 +335,54 @@ type
                               TFastCriticalSection
 --------------------------------------------------------------------------------
 ===============================================================================}
+{
+  Classical critical section - only one thread can acquire lock, and while it
+  is locked all subsequent attemps to acquire/enter it will fail.
+}
 {===============================================================================
     TFastCriticalSection - flat interface declaration
 ===============================================================================}
+{
+  Call FastCriticalSectionInit only once for each flag word. If you call it for
+  already initialized/used flag word, it will be reinitialized.
+
+  FastCriticalSectionFinal will set the section to a state where it cannot
+  be entered or reserved.
+
+  If you reserve the section, then it can only be entered by a call to
+  FastCriticalSectionEnter which also sets the parameter Reserved to true.
+  In other words, if you try to enter reserved section while setting the
+  Reserved param to false, it will fail, even if the section is not locked.
+  An attempt to enter not reserved section while setting param Reserved to true
+  will also always fail.
+
+  Reservation can be made irrespective of whether the section is currently
+  locked or not.
+
+  The reservation can fail and you must check return value to see it if was
+  succcessful.
+
+  There is no protection against situation, where the section is reserved in
+  a different thread than which is currently trying to enter it with Reserved
+  set to true.
+  
+  The section can be reserved multiple times, but each successful reservation
+  must be paired with unreservation.
+
+  Recommended sequence while using reservation is af follows:
+
+    If FastCriticalSectionReserve then
+    try
+      If FastCriticalSectionEnter(True) then
+      try
+        <synchronized_code>
+      finally
+        FastCriticalSectionLeave;
+      end;
+    finally
+      FastCriticalSectionUnreserve;
+    end;
+}
 
 procedure FastCriticalSectionInit(FlagWordPtr: PFLFlagWord);
 procedure FastCriticalSectionFinal(FlagWordPtr: PFLFlagWord);
@@ -280,6 +396,11 @@ procedure FastCriticalSectionLeave(FlagWordPtr: PFLFlagWord);
 {===============================================================================
     TFastCriticalSection - class declaration
 ===============================================================================}
+{
+  Methods SpinToEnter and WaitToEnter are both trying to enter the section
+  with a reservation, ensuring they have "higher priority" than calls to method
+  Enter, which does not reserve the section.
+}
 type
   TFastCriticalSection = class(TFastLock)
   protected
@@ -308,14 +429,14 @@ type
 procedure FastMREWInit(FlagWordPtr: PFLFlagWord);
 procedure FastMREWFinal(FlagWordPtr: PFLFlagWord);
 
-Function FastMREWSectionBeginRead(FlagWordPtr: PFLFlagWord): Boolean;
-procedure FastMREWSectionEndRead(FlagWordPtr: PFLFlagWord);
+Function FastMREWBeginRead(FlagWordPtr: PFLFlagWord): Boolean;
+procedure FastMREWEndRead(FlagWordPtr: PFLFlagWord);
 
 Function FastMREWReserveWrite(FlagWordPtr: PFLFlagWord): Boolean;
 procedure FastMREWUnreserveWrite(FlagWordPtr: PFLFlagWord);
 
-Function FastMREWSectionBeginWrite(FlagWordPtr: PFLFlagWord; Reserved: Boolean = False): Boolean;
-procedure FastMREWSectionEndWrite(FlagWordPtr: PFLFlagWord);
+Function FastMREWBeginWrite(FlagWordPtr: PFLFlagWord; Reserved: Boolean = False): Boolean;
+procedure FastMREWEndWrite(FlagWordPtr: PFLFlagWord);
 
 {===============================================================================
     TFastMultiReadExclusiveWriteSynchronizer - class declaration
@@ -357,7 +478,6 @@ uses
 
 {$IFDEF FPC_DisableWarns}
   {$DEFINE FPCDWM}
-  {$DEFINE W4055:={$WARN 4055 OFF}} // Conversion between ordinals and pointers is not portable
   {$DEFINE W5024:={$WARN 5024 OFF}} // Parameter "$1" not used
 {$ENDIF}
 
@@ -842,7 +962,8 @@ OldFlagWord := _InterlockedExchangeAdd(FlagWordPtr,FL_CS_ACQUIRE_DELTA);
 If ((OldFlagWord and FL_CS_ACQUIRE_MASK) shr FL_CS_ACQUIRE_SHIFT) < FL_CS_ACQUIRE_MAX then
   begin
     If Reserved then
-      Result := (OldFlagWord and not FL_CS_RESERVE_MASK) = FL_UNLOCKED
+      Result := (((OldFlagWord and FL_CS_RESERVE_MASK) shr FL_CS_RESERVE_SHIFT) > 0) and
+                (((OldFlagWord and FL_CS_ACQUIRE_MASK) shr FL_CS_ACQUIRE_SHIFT) = 0)
     else
       Result := OldFlagWord = FL_UNLOCKED;
   end
@@ -963,7 +1084,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function FastMREWSectionBeginRead(FlagWordPtr: PFLFlagWord): Boolean;
+Function FastMREWBeginRead(FlagWordPtr: PFLFlagWord): Boolean;
 begin
 {
   Do not mask or shift the read count. If there is any writer or reservation
@@ -972,11 +1093,11 @@ begin
 Result := _InterlockedExchangeAdd(FlagWordPtr,FL_MREW_READ_DELTA) < FL_MREW_READ_MAX;
 If not Result then
   _InterlockedExchangeSub(FlagWordPtr,FL_MREW_READ_DELTA);
-end;
+end; {$message 'indicate whther this failed due to reservation'}
 
 //------------------------------------------------------------------------------
 
-procedure FastMREWSectionEndRead(FlagWordPtr: PFLFlagWord);
+procedure FastMREWEndRead(FlagWordPtr: PFLFlagWord);
 begin
 _InterlockedExchangeSub(FlagWordPtr,FL_MREW_READ_DELTA);
 end;
@@ -1003,7 +1124,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function FastMREWSectionBeginWrite(FlagWordPtr: PFLFlagWord; Reserved: Boolean = False): Boolean;
+Function FastMREWBeginWrite(FlagWordPtr: PFLFlagWord; Reserved: Boolean = False): Boolean;
 var
   OldFlagWord:  TFLFlagWord;
 begin
@@ -1024,7 +1145,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure FastMREWSectionEndWrite(FlagWordPtr: PFLFlagWord);
+procedure FastMREWEndWrite(FlagWordPtr: PFLFlagWord);
 begin
 _InterlockedExchangeSub(FlagWordPtr,FL_MREW_WRITE_DELTA);
 end;
@@ -1050,30 +1171,32 @@ end;
 
 //------------------------------------------------------------------------------
 
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
 Function TFastMultiReadExclusiveWriteSynchronizer.AcquireRead(Reserved: Boolean): Boolean;
 begin
-Result := FastMREWSectionBeginRead(fFlagWordPtr);
+Result := FastMREWBeginRead(fFlagWordPtr);
 end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
 
 //------------------------------------------------------------------------------
 
 procedure TFastMultiReadExclusiveWriteSynchronizer.ReleaseRead;
 begin
-FastMREWSectionEndRead(fFlagWordPtr);
+FastMREWEndRead(fFlagWordPtr);
 end;
 
 //------------------------------------------------------------------------------
 
 Function TFastMultiReadExclusiveWriteSynchronizer.AcquireWrite(Reserved: Boolean): Boolean;
 begin
-Result := FastMREWSectionBeginWrite(fFlagWordPtr,Reserved);
+Result := FastMREWBeginWrite(fFlagWordPtr,Reserved);
 end;
 
 //------------------------------------------------------------------------------
 
 procedure TFastMultiReadExclusiveWriteSynchronizer.ReleaseWrite;
 begin
-FastMREWSectionEndWrite(fFlagWordPtr);
+FastMREWEndWrite(fFlagWordPtr);
 end;
 
 //------------------------------------------------------------------------------
