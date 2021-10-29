@@ -50,24 +50,19 @@
                 never mix them on one variable.
 
     All synchronizers can be used either directly, where you allocate a variable
-    of type TFLSyncWord and then operate on it using interface functions (eg.
-    FastCriticalSectionReserve, FastMREWBeginRead, ...), or indirectly,
+    of type TFLSyncWord and then operate on it using procedural interface (eg.
+    FastCriticalSectionEnter, FastMREWBeginRead, ...), or indirectly,
     by creating an instance of provided class and using its methods.
 
     When creating the class instance, you can either provide preallocated sync
     word variable or leave its complete management on the instance itself.
     This gives you more freedom in deciding how to use the sychnonization - you
     can either allocate common sync word and create new instance for each
-    syhcnronizing thread, or you can create one common instance and us >it< in
+    syhcnronizing thread, or you can create one common instance and use >it< in
     all threads.
 
-      NOTE - if the sync vord variable is located in a shared memory, the
+      NOTE - if the sync word variable is located in a shared memory, the
              synchronizers can then be used for inter-process synchronization.
-
-    One advantage of instance approach is that they provide a mechanism for
-    waiting - ie. they block until the lock is acquired or timeout elapses.
-    But note that this waiting is always active (spinning), and therefore
-    should be used only rarely and carefully.
 
     Here is a small example how a non-blocking synchronization can be used:
 
@@ -103,7 +98,7 @@
            --   <repeat_if_needed>
                 <unsynchronized_code>
 
-    Some more iportant notes on the implementation and use:
+    Some more important notes on the implementation and use:
 
       - none of the provided synchronizers is robust (when a thread holding
         a lock ends without releasing it, it will stay locked indefinitely)
@@ -117,8 +112,8 @@
         always fail, with exception being MREW reading, which is given by
         concept of multiple readers access)
 
-      - use provided wait methods only when necessary - synchronizers are
-        intended to be used as non-blocking
+      - use provided waiting and spinning only when necessary - synchronizers
+        are intended to be used as non-blocking
 
       - waiting is always active (spinning) - do not wait for prolonged time
         intervals as it might starve other threads, use infinite waiting only
@@ -128,12 +123,12 @@
         not code) routines - do not use to synchronize code that is executing
         longer than few milliseconds
 
-      - every successfull acquire of a synchronizer MUST be paired by a release,
+      - every successful acquire of a synchronizer MUST be paired by a release,
         synhronizers are not automalically released
 
-  Version 1.3 (2021-10-23)
+  Version 1.3 (2021-10-30)
 
-  Last change 2021-10-23
+  Last change 2021-10-30
 
   ©2016-2021 František Milt
 
@@ -172,15 +167,11 @@ unit FastLocks;
 
 {$IFDEF FPC}
   {$MODE ObjFPC}
-  {$MODESWITCH DuplicateLocals+}
   {$MODESWITCH ClassicProcVars+}
   {$DEFINE FPC_DisableWarns}
   {$INLINE ON}
   {$DEFINE CanInline}
   {$MACRO ON}
-  {$IFNDEF PurePascal}
-    {$ASMMODE Intel}
-  {$ENDIF}
 {$ELSE}
   {$IF CompilerVersion >= 17 then}  // Delphi 2005+
     {$DEFINE CanInline}
@@ -194,15 +185,13 @@ unit FastLocks;
 {
   SyncWord64
 
-  When this symbol is defined, the type used for sync words (TFLSyncWord), and
-  therefore the sync words themselves, is 64 bits wide, otherwise it is 32 bits
-  wide.
-
+  When this symbol is defined, the type used for sync word (TFLSyncWord), and
+  therefore the sync word itself, is 64 bits wide, otherwise it is 32 bits wide.
   This holds true on all systems.
 
-  By default defined.
+  By default NOT defined.
 }
-{$DEFINE SyncWord64}
+{.$DEFINE SyncWord64}
 
 interface
 
@@ -221,7 +210,7 @@ type
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                                    TFastLock
+                                   Fast locks                                    
 --------------------------------------------------------------------------------
 ===============================================================================}
 
@@ -236,37 +225,38 @@ type
   PFLSyncWord = ^TFLSyncWord;
 
 {
-  Returned as a result of spinning or waiting (methods SpinTo* and WaitTo*).
+  Returned as a result of spinning or waiting.
+  
   Informs whether the object was acquired and locked, and if not, for what
   reason the locking failed.
 
-    wrAcquired - The object was acquired and is now locked.
+    wrAcquired - The object was acquired and is now locked. Remember to release
+                 it after the lock is no longer needed.
 
-    wrTimeOut  - Spinning/waiting timed-out, ie. locking was not successful in
+    wrTimeout  - Spinning/waiting timed-out, ie. locking was not successful in
                  a given timeout period.
 
     wrReserved - Spinning/waiting failed and the object was not locked because
                  it was reserved or the reserve count reached its maximum.
-                 This is not an error, just a limitation of the implementation,
+                 This is not an error, just a limitation of this implementation,
                  you should try the waiting again after some time.
 
     wrError    - Unknown or external error has ocurred, the object might be in
                  an inconsistent state and should not be used anymore.
 }
-  TFLWaitResult = (wrAcquired,wrTimeOut,wrReserved,wrError);
+  TFLWaitResult = (wrAcquired,wrTimeout,wrReserved,wrError);
 
 {
-  In waiting (methods WaitTo*), the function blocks by executing a cycle. Each
-  iteration of this cycle contains a try to acquire the lock, a check for
-  timeout and a delaying part that prevents rapid calls to acquire and timers.
+  In waiting, the function blocks by executing a cycle. Each iteration of this
+  cycle contains a try to acquire the lock, a check for timeout and a delaying
+  part that prevents rapid calls to acquire and timers.
 
   TFLWaitDelayMethod enumeration is here to select a method used for this
   delaying.
 
     wdNone        No delaying action is performed.
 
-    wdSpin        A call to SpinOn is made with spin count set to a value
-                  stored in property WaitSpinCount.
+    wdSpin        A spinning will be performed. This is the default operation.
 
     wdYield       An attempt to yield execution of current thread is made.
                   If system has another thread that can be run, the current
@@ -299,9 +289,13 @@ type
   TFLWaitDelayMethod = (wdNone,wdSpin,wdYield,wdSleep,wdSleepEx,wdYieldSleep);
 
 {===============================================================================
+--------------------------------------------------------------------------------
+                                    TFastLock
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
     TFastLock - class declaration
 ===============================================================================}
-{$message 'add description of spinning/waiting (SpinDelayCount, WaitSpinCount, ...)'}
 type
   TFastLock = class(TCustomObject)
   protected
@@ -338,41 +332,54 @@ type
 {
   Classical critical section - only one thread can acquire the object, and
   while it is locked all subsequent attemps to acquire it will fail.
+
+  When spinning or waiting, there is no guarantee that the first thread that
+  entered this cycle will also acquire the object. The order in which waiting
+  threads enter the section is undefined and more or less random.
+  Note that while any thread is in spinning or waiting cycle, the section can
+  only be entered by spinning or waiting threads, not by a call to enter. This
+  assures that blocked threads are served before threads which are using the
+  object asynchronously (as it should be).
 }
 {===============================================================================
-    Fast critical section - flat interface declaration
+    Fast critical section - procedural interface declaration
 ===============================================================================}
-{
-  Call FastCriticalSectionInit only once for each sync word. If you call it for
-  already initialized/used sync word, it will be reinitialized.
-
-  FastCriticalSectionFinal will set the section to a state where it cannot
-  be entered or reserved.
-
-  If you reserve the section, then it can only be entered by a call to
-  FastCriticalSectionEnter which also sets the parameter Reserved to true.
-  In other words, if you try to enter reserved section while setting the
-  Reserved param to false, it will fail, even if the section is not locked.
-  An attempt to enter not reserved section while setting param Reserved to true
-  will also always fail.
-
-  Reservation can be made irrespective of whether the section is currently
-  locked or not.
-
-  The reservation can fail and you must check return value to see it if was
-  succcessful.
-
-  There is no protection against situation, where the section is reserved in
-  a different thread than which is currently trying to enter it with Reserved
-  set to true.
-
-}
 
 procedure FastCriticalSectionInit(SyncWordPtr: PFLSyncWord);
 procedure FastCriticalSectionFinal(SyncWordPtr: PFLSyncWord);
 
 Function FastCriticalSectionEnter(SyncWordPtr: PFLSyncWord): Boolean;
 procedure FastCriticalSectionLeave(SyncWordPtr: PFLSyncWord);
+ 
+{
+  A small note on spinning and waiting implementation...
+
+  Spinning:
+
+    In spinning, a cycle is performed. In each iteration of this cycle, an
+    attempt to acquire the object is tried. If it is not successful, a delaying
+    action is executed and then the cycle repeats.
+
+    Maximum number of iterations is limited by a parameter SpinCount, unless it
+    is set to INFINITE, in which case the cycle never terminates.
+
+    The delaying action is a small piece of code with no external effects that
+    is executed multiple times to make this delaying longer. Number of
+    executions is given in parameter SpinDelayCount.
+
+  Waiting:
+
+    Waiting is very similar to spinning in that it runs in a cycle, but the
+    number of iteration is not given explicitly, it depends on a timeout
+    interval.
+
+    In each iteration, and attempt to acquire is made, and when not successful
+    a delaying action is performed. Nature of this action can be selected by
+    a parameter WaitDelayMethod.
+
+    One possible delaying action is spinning. In this case, a spin as described
+    above is performed, with a spin count set to WaitSpinCount.
+}
 
 Function FastCriticalSectionSpinToEnter(SyncWordPtr: PFLSyncWord; SpinCount: UInt32; SpinDelayCount: UInt32 = FL_DEF_SPIN_DELAY_CNT): TFLWaitResult;
 Function FastCriticalSectionWaitToEnter(SyncWordPtr: PFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin;
@@ -386,11 +393,6 @@ Function FastCriticalSectionWaitToEnter(SyncWordPtr: PFLSyncWord; Timeout: UInt3
 {===============================================================================
     TFastCriticalSection - class declaration
 ===============================================================================}
-{
-  Methods SpinToEnter and WaitToEnter are both trying to enter the section
-  with a reservation, ensuring they have "higher priority" than calls to method
-  Enter, which does not reserve the section.
-}
 type
   TFastCriticalSection = class(TFastLock)
   protected
@@ -405,11 +407,38 @@ type
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                    TFastMultiReadExclusiveWriteSynchronizer
+                                    Fast MREW
 --------------------------------------------------------------------------------
 ===============================================================================}
+{
+  This object can be locked in two principal ways - for reading (read lock) or
+  for writing (write lock).
+  Unlike for write lock, where only one can be present at a time, read locks
+  have counter that allows multiple readers to acquire a read lock.
+
+  Acquiring the object for write can only be successful if no reader have a
+  read lock.
+
+  No reader can acquire read lock while the object is locked for writing, or
+  any thread is spinning or waiting for a write lock (this prevents starving
+  of writers by readers - waiting writer excludes any reader to acquire read
+  lock).
+
+  The read lock cannot be promoted to write lock - an attempt to acquire write
+  lock while there is any read lock will always fail.
+
+  While waiting for a read lock, it is entirely possible the object will be
+  locked by other thread for writing. But, as mentioned before, during wait for
+  write lock, no reader can acquire read lock, even through waiting to read.
+
+  The order in which waiting or spinning threads acquire their locks is
+  undefined.
+
+    WARNING - number of readers is limited, 2047 for 32bit sync words (default),
+              2147483647 for 64bit sync words.
+}
 {===============================================================================
-    TFastMultiReadExclusiveWriteSynchronizer - flat interface declaration
+    Fast MREW - procedural interface declaration
 ===============================================================================}
 
 procedure FastMREWInit(SyncWordPtr: PFLSyncWord);
@@ -430,7 +459,12 @@ Function FastMREWWaitToWrite(SyncWordPtr: PFLSyncWord; Timeout: UInt32; WaitDela
   WaitSpinCount: UInt32 = FL_DEF_WAIT_SPIN_CNT; SpinDelayCount: UInt32 = FL_DEF_SPIN_DELAY_CNT): TFLWaitResult;
 
 {===============================================================================
-    TFastMultiReadExclusiveWriteSynchronizer - class declaration
+--------------------------------------------------------------------------------
+                                    TFastMREW
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TFastMREW - class declaration
 ===============================================================================}
 type
   TFastMREW = class(TFastLock)
@@ -457,7 +491,7 @@ uses
 {$IFDEF Windows}
   Windows,
 {$ELSE}
-  unixtype, baseunix, linux,
+  baseunix, linux,
 {$ENDIF}
   InterlockedOps;
 
@@ -467,10 +501,15 @@ uses
 {$ENDIF}
 
 {===============================================================================
-    Internal functions
+--------------------------------------------------------------------------------
+                                   Fast locks
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    Fast locks - internal functions
 ===============================================================================}
 
-Function SpinDelay(Divisor: UInt32): UInt32;
+Function SpinDelay(Divisor: UInt32): UInt32;  // do not inline
 begin
 // just some contained, relatively long, but othervise pointless operation
 Result := UInt32(3895731025) div Divisor;
@@ -530,7 +569,7 @@ Function sched_yield: cint; cdecl; external;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-Function YieldThread: Boolean;
+Function YieldThread: Boolean;{$IFDEF CanInline} inline;{$ENDIF}
 begin
 {$IFDEF Windows}
 Result := SwitchToThread;
@@ -540,7 +579,7 @@ Result := sched_yield = 0;
 end;
 
 {===============================================================================
-    Interlocked function wrappers
+    Fast locks - interlocked functions wrappers
 ===============================================================================}
 
 Function _InterlockedExchangeAdd(A: PFLSyncWord; B: TFLSyncWord): TFLSyncWord;{$IFDEF CanInline} inline;{$ENDIF}
@@ -564,79 +603,16 @@ Result := InterlockedExchangeSub32(A,B);
 end;
 
 {===============================================================================
-    Imlementation constants
-===============================================================================}
-
-(*
-{
-  Meaning of bits in main sync word in TFastCriticalSection:
-
-    bit 0..7  - acquire count
-    bit 8..27 - reserve count
-}
-{
-  FL_CS_MAX_ACQUIRE
-
-    If acquire count is found to be above this value during acquiring, the
-    acquire automatically fails without any further checks (it is to prevent
-    acquire count to overflow into reservation count).
-
-}
-  FL_CS_ACQUIRE_DELTA = 1;
-  FL_CS_ACQUIRE_MASK  = UInt32($000000FF);
-  FL_CS_ACQUIRE_MAX   = 150;   {must be lower than $FF (255)}
-
-{
-  FL_CS_MAX_RESERVE
-
-    Maximum number of reservations, if reservation count is found to be above
-    this value, the reservation fails and consequently the wait function will
-    return an error.
-}
-  FL_CS_RESERVE_DELTA = $100;
-  FL_CS_RESERVE_MASK  = UInt32($0FFFFF00);
-  FL_CS_RESERVE_MAX   = 750000 {must be lower than $FFFFF (1048575)};
-  FL_CS_RESERVE_SHIFT = 8;
-
-//------------------------------------------------------------------------------
-{
-  Meaning of bits in main sync word in TFastMREW:
-
-    bit 0..13   - read count
-    bit 14..27  - write reservation count
-    bit 28..31  - write count
-}
-  FL_MREW_READ_DELTA = 1;
-  FL_MREW_READ_MAX   = 10000 {must be lower than $3FFF (16383)};
-
-  FL_MREW_RESERVE_DELTA = UInt32($4000);
-  FL_MREW_RESERVE_MASK  = UInt32($0FFFC000);
-  FL_MREW_RESERVE_MAX   = 10000 {must be lower than $3FFF (16383)};
-  FL_MREW_RESERVE_SHIFT = 14;
-
-  FL_MREW_WRITE_DELTA = UInt32($10000000);
-  FL_MREW_WRITE_MAX   = 8;    {must be lower than 16}
-  FL_MREW_WRITE_SHIFT = 28;
-*)
-
-{===============================================================================
---------------------------------------------------------------------------------
-                                   Fast locks
---------------------------------------------------------------------------------
-===============================================================================}
-{===============================================================================
     Fast locks - imlementation constants
 ===============================================================================}
-
 const
   FL_UNLOCKED = TFLSyncWord(0);
 
-  FL_INVALID = TFLSyncWord(-1);
+  FL_INVALID = TFLSyncWord(-1); // used to finalize the objects
 
 {===============================================================================
-    Fast locks - waiting and spinning
+    Fast locks - waiting and spinning implementation
 ===============================================================================}
-
 type
   TFLSpinParams = record
     SyncWordPtr:    PFLSyncWord;
@@ -687,7 +663,7 @@ Function _DoSpin(Params: TFLSpinParams): TFLWaitResult;
           Result := wrReserved;
           Exit;
         end;
-    // if we are here, acquire was successful    
+    // if we are here, acquire was successful
     Result := wrAcquired;
   end;
 
@@ -937,7 +913,13 @@ end;
 {===============================================================================
     Fast critical section - imlementation constants
 ===============================================================================}
+{
+  Meaning of bits in sync word for fast critical section:
 
+    32bit     64bit
+     0..15     0..31    - acquire count
+    16..31    32..63    - reserve count
+}
 const
 {$IFDEF SyncWord64}
 
@@ -955,12 +937,12 @@ const
 
   FL_CS_ACQUIRE_DELTA = TFLSyncWord($00000001);
   FL_CS_ACQUIRE_MASK  = TFLSyncWord($0000FFFF);
-  FL_CS_ACQUIRE_MAX   = TFLSyncWord(32767);   // 0x7FFF
+  FL_CS_ACQUIRE_MAX   = TFLSyncWord(32767);       // 0x7FFF
   FL_CS_ACQUIRE_SHIFT = 0;
 
   FL_CS_RESERVE_DELTA = TFLSyncWord($00010000);
   FL_CS_RESERVE_MASK  = TFLSyncWord($FFFF0000);
-  FL_CS_RESERVE_MAX   = TFLSyncWord(32767);   // 0x7FFF
+  FL_CS_RESERVE_MAX   = TFLSyncWord(32767);       // 0x7FFF
   FL_CS_RESERVE_SHIFT = 16;
 
 {$ENDIF}  
@@ -1154,9 +1136,20 @@ end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                    TFastMREW
+                                    Fast MREW
 --------------------------------------------------------------------------------
 ===============================================================================}
+{===============================================================================
+    Fast MREW - implementation constants
+===============================================================================}
+{
+  Meaning of bits in sync word for fast MREW:
+
+    32bit     64bit
+     0..11     0..31    - read count
+    12..21    32..47    - write count
+    22..31    48..63    - write reserve count
+}
 const
 {$IFDEF SyncWord64}
 
@@ -1179,24 +1172,27 @@ const
 
   FL_MREW_READ_DELTA = TFLSyncWord($00000001);
   FL_MREW_READ_MASK  = TFLSyncWord($00000FFF);
-  FL_MREW_READ_MAX   = TFLSyncWord(2047);   // 0x7FF
+  FL_MREW_READ_MAX   = TFLSyncWord(2047);       // 0x7FF
   FL_MREW_READ_SHIFT = 0;
 
   FL_MREW_WRITE_DELTA = TFLSyncWord($00001000);
   FL_MREW_WRITE_MASK  = TFLSyncWord($003FF000);
-  FL_MREW_WRITE_MAX   = TFLSyncWord(512);   // 0x1FF
+  FL_MREW_WRITE_MAX   = TFLSyncWord(512);       // 0x1FF
   FL_MREW_WRITE_SHIFT = 12;
 
   FL_MREW_RESERVE_DELTA = TFLSyncWord($00400000);
   FL_MREW_RESERVE_MASK  = TFLSyncWord($FFC00000);
-  FL_MREW_RESERVE_MAX   = TFLSyncWord(512); // 0x1FF
+  FL_MREW_RESERVE_MAX   = TFLSyncWord(512);     // 0x1FF
   FL_MREW_RESERVE_SHIFT = 22;  
 
 {$ENDIF}
 
 {===============================================================================
-    TFastMREW - procedural interface implementation
+    Fast MREW - procedural interface implementation
 ===============================================================================}
+{-------------------------------------------------------------------------------
+    Fast MREW - internal functions
+-------------------------------------------------------------------------------}
 
 Function _FastMREWReserveWrite(SyncWordPtr: PFLSyncWord): Boolean;
 var
@@ -1218,6 +1214,7 @@ end;
 
 //------------------------------------------------------------------------------
 
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
 Function _FastMREWBeginRead(SyncWordPtr: PFLSyncWord; Reserved: Boolean; out FailedDueToReservation: Boolean): Boolean;
 var
   OldSyncWord:  TFLSyncWord;
@@ -1238,6 +1235,7 @@ If OldSyncWord >= FL_MREW_READ_MAX then
   end
 else Result := True;
 end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
 
 //------------------------------------------------------------------------------
 
@@ -1303,7 +1301,7 @@ Result := _DoWait(WaitParams);
 end;
 
 {-------------------------------------------------------------------------------
-    Fast RW lock - public functions
+    Fast MREW - public functions
 -------------------------------------------------------------------------------}
 
 procedure FastMREWInit(SyncWordPtr: PFLSyncWord);
@@ -1412,6 +1410,11 @@ else
                                   [{$IFDEF Windows}GetLastError{$ELSE}errno{$ENDIF}]);
 end;
 
+{===============================================================================
+--------------------------------------------------------------------------------
+                                    TFastMREW
+--------------------------------------------------------------------------------
+===============================================================================}
 {===============================================================================
     TFastMREW - class implementation
 ===============================================================================}
