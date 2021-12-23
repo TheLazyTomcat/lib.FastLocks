@@ -126,9 +126,9 @@
       - every successful acquire of a synchronizer MUST be paired by a release,
         synhronizers are not automalically released
 
-  Version 1.3 (2021-10-30)
+  Version 1.3.1 (2021-12-24)
 
-  Last change 2021-10-30
+  Last change 2021-12-24
 
   ©2016-2021 František Milt
 
@@ -579,30 +579,6 @@ Result := sched_yield = 0;
 end;
 
 {===============================================================================
-    Fast locks - interlocked functions wrappers
-===============================================================================}
-
-Function _InterlockedExchangeAdd(A: PFLSyncWord; B: TFLSyncWord): TFLSyncWord;{$IFDEF CanInline} inline;{$ENDIF}
-begin
-{$IFDEF SyncWord64}
-Result := InterlockedExchangeAdd64(A,B);      
-{$ELSE}
-Result := InterlockedExchangeAdd32(A,B);
-{$ENDIF}
-end;
-
-//------------------------------------------------------------------------------
-
-Function _InterlockedExchangeSub(A: PFLSyncWord; B: TFLSyncWord): TFLSyncWord;{$IFDEF CanInline} inline;{$ENDIF}
-begin
-{$IFDEF SyncWord64}
-Result := InterlockedExchangeSub64(A,B);
-{$ELSE}
-Result := InterlockedExchangeSub32(A,B);
-{$ENDIF}
-end;
-
-{===============================================================================
     Fast locks - imlementation constants
 ===============================================================================}
 const
@@ -958,17 +934,17 @@ Function _FastCriticalSectionReserve(var SyncWord: TFLSyncWord): Boolean;
 var
   OldSyncWord:  TFLSyncWord;
 begin
-OldSyncWord := _InterlockedExchangeAdd(@SyncWord,FL_CS_RESERVE_DELTA);
+OldSyncWord := InterlockedExchangeAdd(SyncWord,FL_CS_RESERVE_DELTA);
 Result := ((OldSyncWord and FL_CS_RESERVE_MASK) shr FL_CS_RESERVE_SHIFT) < FL_CS_RESERVE_MAX;
 If not Result then
-  _InterlockedExchangeSub(@SyncWord,FL_CS_RESERVE_DELTA);
+  InterlockedExchangeSub(SyncWord,FL_CS_RESERVE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
 
 procedure _FastCriticalSectionUnreserve(var SyncWord: TFLSyncWord);
 begin
-_InterlockedExchangeSub(@SyncWord,FL_CS_RESERVE_DELTA);
+InterlockedExchangeSub(SyncWord,FL_CS_RESERVE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
@@ -978,7 +954,7 @@ var
   OldSyncWord:  TFLSyncWord;
 begin
 FailedDueToReservation := False;
-OldSyncWord := _InterlockedExchangeAdd(@SyncWord,FL_CS_ACQUIRE_DELTA);
+OldSyncWord := InterlockedExchangeAdd(SyncWord,FL_CS_ACQUIRE_DELTA);
 If ((OldSyncWord and FL_CS_ACQUIRE_MASK) shr FL_CS_ACQUIRE_SHIFT) < FL_CS_ACQUIRE_MAX then
   begin
     If Reserved then
@@ -989,7 +965,7 @@ If ((OldSyncWord and FL_CS_ACQUIRE_MASK) shr FL_CS_ACQUIRE_SHIFT) < FL_CS_ACQUIR
   end
 else Result := False;
 If not Result then
-  _InterlockedExchangeSub(@SyncWord,FL_CS_ACQUIRE_DELTA);
+  InterlockedExchangeSub(SyncWord,FL_CS_ACQUIRE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
@@ -1018,14 +994,18 @@ end;
 
 procedure FastCriticalSectionInit(out SyncWord: TFLSyncWord);
 begin
-SyncWord := FL_UNLOCKED;
+{$IFDEF SyncWord64}
+InterlockedStore64(@SyncWord,FL_UNLOCKED);
+{$ELSE}
+InterlockedStore32(@SyncWord,FL_UNLOCKED);
+{$ENDIF}
 end;
 
 //------------------------------------------------------------------------------
 
 procedure FastCriticalSectionFinal(var SyncWord: TFLSyncWord);
 begin
-SyncWord := FL_INVALID;
+InterlockedStore(SyncWord,FL_INVALID);
 end;
 
 //------------------------------------------------------------------------------
@@ -1035,13 +1015,15 @@ var
   FailedDueToReservation: Boolean;
 begin
 Result := _FastCriticalSectionEnter(SyncWord,False,FailedDueToReservation);
+ReadWriteBarrier;
 end;
 
 //------------------------------------------------------------------------------
 
 procedure FastCriticalSectionLeave(var SyncWord: TFLSyncWord);
 begin
-_InterlockedExchangeSub(@SyncWord,FL_CS_ACQUIRE_DELTA);
+ReadWriteBarrier;
+InterlockedExchangeSub(SyncWord,FL_CS_ACQUIRE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
@@ -1059,6 +1041,7 @@ SpinParams.FceReserve := _FastCriticalSectionReserve;
 SpinParams.FceUnreserve := _FastCriticalSectionUnreserve;
 SpinParams.FceAcquire := _FastCriticalSectionEnter;
 Result := _DoSpin(SpinParams);
+ReadWriteBarrier;
 end;
 
 //------------------------------------------------------------------------------
@@ -1069,10 +1052,12 @@ var
   CounterFrequency: Int64;
 begin
 If GetCounterFrequency(CounterFrequency) then
-  Result := _FastCriticalSectionWaitToEnter(SyncWord,Timeout,WaitDelayMethod,WaitSpinCount,SpinDelayCount,CounterFrequency)
-else
-  raise EFLCounterError.CreateFmt('FastCriticalSectionWaitToEnter: Cannot obtain counter frequency (0x%.8x).',
-                                  [{$IFDEF Windows}GetLastError{$ELSE}errno{$ENDIF}]);
+  begin
+    Result := _FastCriticalSectionWaitToEnter(SyncWord,Timeout,WaitDelayMethod,WaitSpinCount,SpinDelayCount,CounterFrequency);
+    ReadWriteBarrier;
+  end
+else raise EFLCounterError.CreateFmt('FastCriticalSectionWaitToEnter: Cannot obtain counter frequency (0x%.8x).',
+                                     [{$IFDEF Windows}GetLastError{$ELSE}errno{$ENDIF}]);
 end;
 
 {===============================================================================
@@ -1131,6 +1116,7 @@ end;
 Function TFastCriticalSection.WaitToEnter(Timeout: UInt32): TFLWaitResult;
 begin
 Result := _FastCriticalSectionWaitToEnter(fSyncWordPtr^,Timeout,GetWaitDelayMethod,GetWaitSpinCount,GetSpinDelayCount,fCounterFreq);
+ReadWriteBarrier;
 end;
 
 
@@ -1198,18 +1184,18 @@ Function _FastMREWReserveWrite(var SyncWord: TFLSyncWord): Boolean;
 var
   OldSyncWord:  TFLSyncWord;
 begin
-OldSyncWord := _InterlockedExchangeAdd(@SyncWord,FL_MREW_RESERVE_DELTA);
+OldSyncWord := InterlockedExchangeAdd(SyncWord,FL_MREW_RESERVE_DELTA);
 // note that reservation is allowed if there are readers, but no new reader can enter
 Result := ((OldSyncWord and FL_MREW_RESERVE_MASK) shr FL_MREW_RESERVE_SHIFT) < FL_MREW_RESERVE_MAX;
 If not Result then
-  _InterlockedExchangeSub(@SyncWord,FL_MREW_RESERVE_DELTA);
+  InterlockedExchangeSub(SyncWord,FL_MREW_RESERVE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
 
 procedure _FastMREWUnreserveWrite(var SyncWord: TFLSyncWord);
 begin
-_InterlockedExchangeSub(@SyncWord,FL_MREW_RESERVE_DELTA);
+InterlockedExchangeSub(SyncWord,FL_MREW_RESERVE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
@@ -1220,14 +1206,14 @@ var
   OldSyncWord:  TFLSyncWord;
 begin
 FailedDueToReservation := False;
-OldSyncWord := _InterlockedExchangeAdd(@SyncWord,FL_MREW_READ_DELTA);
+OldSyncWord := InterlockedExchangeAdd(SyncWord,FL_MREW_READ_DELTA);
 {
   Do not mask or shift the read count. If there is any writer or reservation
   (which would manifest as count being above reader maximum), straight up fail.
 }
 If OldSyncWord >= FL_MREW_READ_MAX then
   begin
-    _InterlockedExchangeSub(@SyncWord,FL_MREW_READ_DELTA);
+    InterlockedExchangeSub(SyncWord,FL_MREW_READ_DELTA);
     // indicate whether this failed solely due to reservation
     FailedDueToReservation := (((OldSyncWord and FL_MREW_WRITE_MASK) shr FL_MREW_WRITE_SHIFT) = 0) and
                               (((OldSyncWord and FL_MREW_RESERVE_MASK) shr FL_MREW_RESERVE_SHIFT) <> 0);
@@ -1264,7 +1250,7 @@ var
   OldSyncWord:  TFLSyncWord;
 begin
 FailedDueToReservation := False;
-OldSyncWord := _InterlockedExchangeAdd(@SyncWord,FL_MREW_WRITE_DELTA);
+OldSyncWord := InterlockedExchangeAdd(SyncWord,FL_MREW_WRITE_DELTA);
 // there can be no reader if writer is to be allowed to enter
 If (((OldSyncWord and FL_MREW_READ_MASK) shr FL_MREW_READ_SHIFT) = 0) and
    (((OldSyncWord and FL_MREW_WRITE_MASK) shr FL_MREW_WRITE_SHIFT) < FL_MREW_WRITE_MAX) then
@@ -1277,7 +1263,7 @@ If (((OldSyncWord and FL_MREW_READ_MASK) shr FL_MREW_READ_SHIFT) = 0) and
   end
 else Result := False;
 If not Result then
-  _InterlockedExchangeSub(@SyncWord,FL_MREW_WRITE_DELTA);
+  InterlockedExchangeSub(SyncWord,FL_MREW_WRITE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
@@ -1306,14 +1292,18 @@ end;
 
 procedure FastMREWInit(out SyncWord: TFLSyncWord);
 begin
-SyncWord := FL_UNLOCKED;
+{$IFDEF SyncWord64}
+InterlockedStore64(@SyncWord,FL_UNLOCKED);
+{$ELSE}
+InterlockedStore32(@SyncWord,FL_UNLOCKED);
+{$ENDIF}
 end;
 
 //------------------------------------------------------------------------------
 
 procedure FastMREWFinal(var SyncWord: TFLSyncWord);
 begin
-SyncWord := FL_INVALID;
+InterlockedStore(SyncWord,FL_INVALID);
 end;
 
 //------------------------------------------------------------------------------
@@ -1323,13 +1313,15 @@ var
   FailedDueToReservation: Boolean;
 begin
 Result := _FastMREWBeginRead(SyncWord,False,FailedDueToReservation);
+ReadWriteBarrier;
 end;
 
 //------------------------------------------------------------------------------
 
 procedure FastMREWEndRead(var SyncWord: TFLSyncWord);
 begin
-_InterlockedExchangeSub(@SyncWord,FL_MREW_READ_DELTA);
+ReadWriteBarrier;
+InterlockedExchangeSub(SyncWord,FL_MREW_READ_DELTA);
 end;
 
 //------------------------------------------------------------------------------
@@ -1347,6 +1339,7 @@ SpinParams.FceReserve := _FastMREWReserveWrite;
 SpinParams.FceUnreserve := _FastMREWUnreserveWrite;
 SpinParams.FceAcquire := _FastMREWBeginRead;
 Result := _DoSpin(SpinParams);
+ReadWriteBarrier;
 end;
 
 //------------------------------------------------------------------------------
@@ -1357,10 +1350,12 @@ var
   CounterFrequency: Int64;
 begin
 If GetCounterFrequency(CounterFrequency) then
-  Result := _FastMREWWaitToRead(SyncWord,Timeout,WaitDelayMethod,WaitSpinCount,SpinDelayCount,CounterFrequency)
-else
-  raise EFLCounterError.CreateFmt('FastMREWWaitToRead: Cannot obtain counter frequency (0x%.8x).',
-                                  [{$IFDEF Windows}GetLastError{$ELSE}errno{$ENDIF}]);
+  begin
+    Result := _FastMREWWaitToRead(SyncWord,Timeout,WaitDelayMethod,WaitSpinCount,SpinDelayCount,CounterFrequency);
+    ReadWriteBarrier;
+  end
+else raise EFLCounterError.CreateFmt('FastMREWWaitToRead: Cannot obtain counter frequency (0x%.8x).',
+                                     [{$IFDEF Windows}GetLastError{$ELSE}errno{$ENDIF}]);
 end;
 
 //------------------------------------------------------------------------------
@@ -1370,13 +1365,15 @@ var
   FailedDueToReservation: Boolean;
 begin
 Result := _FastMREWBeginWrite(SyncWord,False,FailedDueToReservation);
+ReadWriteBarrier;
 end;
 
 //------------------------------------------------------------------------------
 
 procedure FastMREWEndWrite(var SyncWord: TFLSyncWord);
 begin
-_InterlockedExchangeSub(@SyncWord,FL_MREW_WRITE_DELTA);
+ReadWriteBarrier;
+InterlockedExchangeSub(SyncWord,FL_MREW_WRITE_DELTA);
 end;
 
 //------------------------------------------------------------------------------
@@ -1394,6 +1391,7 @@ SpinParams.FceReserve := _FastMREWReserveWrite;
 SpinParams.FceUnreserve := _FastMREWUnreserveWrite;
 SpinParams.FceAcquire := _FastMREWBeginWrite;
 Result := _DoSpin(SpinParams);
+ReadWriteBarrier;
 end;
 
 //------------------------------------------------------------------------------
@@ -1404,10 +1402,12 @@ var
   CounterFrequency: Int64;
 begin
 If GetCounterFrequency(CounterFrequency) then
-  Result := _FastMREWWaitToWrite(SyncWord,Timeout,WaitDelayMethod,WaitSpinCount,SpinDelayCount,CounterFrequency)
-else
-  raise EFLCounterError.CreateFmt('FastMREWWaitToWrite: Cannot obtain counter frequency (0x%.8x).',
-                                  [{$IFDEF Windows}GetLastError{$ELSE}errno{$ENDIF}]);
+  begin
+    Result := _FastMREWWaitToWrite(SyncWord,Timeout,WaitDelayMethod,WaitSpinCount,SpinDelayCount,CounterFrequency);
+    ReadWriteBarrier;
+  end
+else raise EFLCounterError.CreateFmt('FastMREWWaitToWrite: Cannot obtain counter frequency (0x%.8x).',
+                                     [{$IFDEF Windows}GetLastError{$ELSE}errno{$ENDIF}]);
 end;
 
 {===============================================================================
@@ -1480,6 +1480,7 @@ end;
 Function TFastMREW.WaitToRead(Timeout: UInt32): TFLWaitResult;
 begin
 Result := _FastMREWWaitToRead(fSyncWordPtr^,Timeout,GetWaitDelayMethod,GetWaitSpinCount,GetSpinDelayCount,fCounterFreq);
+ReadWriteBarrier;
 end;
 
 //------------------------------------------------------------------------------
@@ -1494,6 +1495,7 @@ end;
 Function TFastMREW.WaitToWrite(Timeout: UInt32): TFLWaitResult;
 begin
 Result := _FastMREWWaitToWrite(fSyncWordPtr^,Timeout,GetWaitDelayMethod,GetWaitSpinCount,GetSpinDelayCount,fCounterFreq);
+ReadWriteBarrier;
 end;
 
 end.
