@@ -128,9 +128,9 @@
 
   Version 1.3.1 (2021-12-24)
 
-  Last change 2021-12-24
+  Last change 2022-06-25
 
-  ©2016-2021 František Milt
+  ©2016-2022 František Milt
 
   Contacts:
     František Milt: frantisek.milt@gmail.com
@@ -190,8 +190,14 @@ unit FastLocks;
   This holds true on all systems.
 
   By default NOT defined.
+
+  To enable/define this symbol in a project without changing this library,
+  define project-wide symbol FastLocks_SyncWord64_On.
 }
 {.$DEFINE SyncWord64}
+{$IFDEF FastLocks_SyncWord64_On}
+  {$DEFINE SyncWord64}
+{$ENDIF}
 
 interface
 
