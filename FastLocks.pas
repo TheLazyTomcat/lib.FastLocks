@@ -15,10 +15,10 @@
     WARNING >>>
 
       This library was written for a specific scenario, where there was tens
-      of thousand of separate data structures, each of which could have been
-      accessed by several threads, and where concurrent access was rare but
-      very possible and dangerous. When a simultaneous access occured, it was
-      almost always reading.
+      of thousands of separate data structures, each of which could have been
+      accessed by several threads, and where parallel access was rare but very
+      possible and dangerous. When a simultaneous access occured, it was almost
+      always reading.
 
       Creating RW lock for each of the structure was unfeasible, so this
       library was written to provide some light-weight locking mechanism with
@@ -49,10 +49,13 @@
                 So always use one sync word for only one type of synchronizer,
                 never mix them on one variable.
 
-    All synchronizers can be used either directly, where you allocate a variable
+      WARNING - do not directly read or write sync word variables, use only
+                functions provided for individual synchronizers.
+
+    All synchronizers can be used either directly, where you declare or allocate a variable
     of type TFLSyncWord and then operate on it using procedural interface (eg.
-    FastCriticalSectionEnter, FastMREWBeginRead, ...), or indirectly,
-    by creating an instance of provided class and using its methods.
+    FastCriticalSectionEnter, FastMREWBeginRead, ...), or indirectly, creating
+    an instance of provided class and using its methods.
 
     When creating the class instance, you can either provide preallocated sync
     word variable or leave its complete management on the instance itself.
@@ -113,7 +116,7 @@
         concept of multiple readers access)
 
       - use provided waiting and spinning only when necessary - synchronizers
-        are intended to be used as non-blocking
+        are intended to be primarily used as non-blocking
 
       - waiting is always active (spinning) - do not wait for prolonged time
         intervals as it might starve other threads, use infinite waiting only
@@ -165,7 +168,20 @@
     WinFileInfo - github.com/TheLazyTomcat/Lib.WinFileInfo
 
 ===============================================================================}
+{$message 'todo: rework description'}
 unit FastLocks;
+{
+  FastLocks_PurePascal
+
+  If you want to compile this unit without ASM, don't want to or cannot define
+  PurePascal for the entire project and at the same time you don't want to or
+  cannot make changes to this unit, define this symbol for the entire project
+  and only this unit will be compiled in PurePascal mode.
+}
+{$IFDEF FastLocks_PurePascal}
+  {$DEFINE PurePascal}
+{$ENDIF}
+
 {
   FastLocks_UseAuxExceptions
 
@@ -177,8 +193,15 @@ unit FastLocks;
 {$IF Defined(FastLocks_UseAuxExceptions)}
   {$DEFINE UseAuxExceptions}
 {$IFEND}
-
 //------------------------------------------------------------------------------
+
+{$IF defined(CPUX86_64) or defined(CPUX64)}
+  {$DEFINE x64}
+{$ELSEIF defined(CPU386)}
+  {$DEFINE x86}
+{$ELSE}
+  {$DEFINE PurePascal}
+{$IFEND}
 
 {$IF Defined(WINDOWS) or Defined(MSWINDOWS)}
   {$DEFINE Windows}
@@ -192,9 +215,12 @@ unit FastLocks;
   {$MODE ObjFPC}
   {$MODESWITCH ClassicProcVars+}
   {$DEFINE FPC_DisableWarns}
-  {$INLINE ON}
-  {$DEFINE CanInline}
   {$MACRO ON}
+  {$DEFINE CanInline}  
+  {$INLINE ON}
+  {$IFNDEF PurePascal}
+    {$ASMMODE Intel}
+  {$ENDIF}
 {$ELSE}
   {$IF CompilerVersion >= 17} // Delphi 2005+
     {$DEFINE CanInline}
@@ -210,14 +236,17 @@ unit FastLocks;
 
   When this symbol is defined, the type used for sync word (TFLSyncWord), and
   therefore the sync word itself, is 64 bits wide, otherwise it is 32 bits wide.
-  This holds true on all systems.
+  This is true on all systems, irrespective of whether they are 32bit or 64bit.
+
+    NOTE - 64bit sync words require that library InterlockedOps provides
+           support for 64bit arguments, see there for details.
 
   By default NOT defined.
 
   To enable/define this symbol in a project without changing this library,
   define project-wide symbol FastLocks_SyncWord64_On.
 }
-{.$DEFINE SyncWord64}
+{$UNDEF SyncWord64}
 {$IFDEF FastLocks_SyncWord64_On}
   {$DEFINE SyncWord64}
 {$ENDIF}
@@ -234,124 +263,530 @@ uses
 type
   EFLException = class({$IFDEF UseAuxExceptions}EAEGeneralException{$ELSE}Exception{$ENDIF});
 
-  EFLCounterError = class(EFLException);
+  EFLClockError   = class(EFLException);
+  EFLInvalidState = class(EFLException);
   EFLInvalidValue = class(EFLException);
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                                   Fast locks                                    
+                                   Fast locks
 --------------------------------------------------------------------------------
 ===============================================================================}
-
-const
-  FL_DEF_SPIN_DELAY_CNT = 1000; // default value of SpinDelayCount
-  FL_DEF_WAIT_SPIN_CNT  = 1500; // default value of WaitSpinCount
-
-  INFINITE = UInt32(-1);  // infinite timeout interval
-
 type
-  TFLSyncWord = {$IFDEF SyncWord64}UInt64{$ELSE}UInt32{$ENDIF};
+  TFLSyncWord = {$IFDEF SyncWord64}Int64{$ELSE}Int32{$ENDIF};
   PFLSyncWord = ^TFLSyncWord;
+  
+//------------------------------------------------------------------------------
+{
+  TFLWaitDelayMethod
+
+  During waiting (functions and methods ...WaitTo...), the call blocks by
+  executing a cycle where each iteration of this cycle attempts to acquire
+  the lock - if this fails then a check for timeout is made, followed by a
+  delaying part that prevents rapid repeated calls to acquire and timers.
+
+  This enumeration is here to select a method used for this delaying.
+
+    dmNone          - No delaying action is performed. Use this only in
+                      situations where you know the synchronizer will not
+                      stay locked for long.
+
+    dmSpin          - A spinning will be performed. See description of types
+                      TFLSpinParams and TFLWaitParams for more details about
+                      spinning. This is the default operation.
+
+    dmYield         - An attempt to yield execution of current thread is made.
+                      If system has another thread that can be run, the current
+                      thread is suspended, rescheduled and next thread is run.
+                      If there is no thread awaiting execution, then the
+                      current thread is not suspended and continues execution
+                      and pretty much performs spinning.
+
+                        WARNING - use with caution, as it can cause spinning
+                                  with rapid calls to thread yielding on
+                                  uncontested CPU.
+
+    dmSleep         - The current thread suspends its own execution (using a
+                      call to function Sleep) for number of milliseconds given
+                      in field SleepTime of WaitParams.
+                      Note that this time is usually longer because of
+                      granularity of scheduling timers, resulting in slightly
+                      longer wait time than is requested.
+
+    dmSleepEx       - Behaves the same as dmSleep, but the thread can be
+                      awakened by APC or I/O completion calls.
+
+                        NOTE - useful only on Windows, everywhere else it
+                               behaves the same as dmSleep.
+
+    dmYieldSleep    - Combination od dmYield and dmSleep - when the thread
+                      is not yielded (eg. because no other thread is awaiting
+                      execution), a sleep is performed.
+
+                        NOTE - useful only on Windows, everywhere else it
+                               behaves the same as dmSleep.                      
+
+    dmYieldSleepEx  - Works the same as dmYieldSleep, but the sleep allows
+                      for thread wakeup by APC or I/O completion calls.
+
+                        NOTE - useful only on Windows, everywhere else it
+                               behaves the same as dmYieldSleep.
+}
+  TFLWaitDelayMethod = (dmNone,dmSpin,dmYield,dmSleep,dmSleepEx,dmYieldSleep,
+                        dmYieldSleepEx);
 
 {
-  Returned as a result of spinning or waiting.
-  
-  Informs whether the object was acquired and locked, and if not, for what
-  reason the locking failed.
+  TFLSpinParams
 
-    wrAcquired - The object was acquired and is now locked. Remember to release
-                 it after the lock is no longer needed.
+  Structure used to pass parameters into spinning.
 
-    wrTimeout  - Spinning/waiting timed-out, ie. locking was not successful in
-                 a given timeout period.
+  In spinning, a cycle is performed. In each iteration of this cycle, an
+  attempt to acquire the object is tried. If it is not successful, a delaying
+  action is executed and then the cycle repeats.
 
-    wrReserved - Spinning/waiting failed and the object was not locked because
-                 it was reserved or the reserve count reached its maximum.
-                 This is not an error, just a limitation of this implementation,
-                 you should try the waiting again after some time.
+  Maximum number of these iterations is limited by value of field SpinCount,
+  unless it is set to INFINITE, in which case the cycle never terminates.
+
+  The delaying action is a small piece of code with no external effects that
+  is executed multiple times to make this delaying longer. Number of executions
+  is controlled by field DelayCount.
+}
+  TFLSpinParams = record
+    SpinCount:  UInt32;
+    DelayCount: UInt32;
+  end;
+
+{
+  TFLWaitParams
+
+  Used to pass parameters for waiting.
+
+  Waiting is very similar to spinning in that it runs in a cycle, but the
+  number of iteration is not given explicitly, it depends on a timeout interval.
+
+  In each iteration, and attempt to acquire is made, and when not successful
+  a delaying action is performed. Nature of this action can be selected by
+  field DelayMethod.
+
+  One possible delaying action is spinning. In this case, a spin as described
+  in description of type TFLSpinParams is performed and values for SpinCount
+  and DelayCount are taken from variant fields of the same name here.
+
+    NOTE - SpinCount here can be se to INFINITE, but it will not be unbound.
+           Instead, a numerical value of this constant is used as the count.
+
+  If any action that is performing sleep is selected, you can define number of
+  milliseconds to sleep in field SleepTime.
+}
+  TFLWaitParams = record
+    Timeout:          UInt32;
+    case DelayMethod: TFLWaitDelayMethod of
+      dmSpin: (
+        SpinCount:      UInt32;
+        DelayCount:     UInt32);
+      dmSleep,
+      dmSleepEx,
+      dmYieldSleep,
+      dmYieldSleepEx: (
+        SleepTime:      UInt32);
+  end;
+
+const
+  // infinite spin count or timeout interval
+  INFINITE = UInt32(-1);
+
+  DefaultSpinParams: TFLSpinParams = (
+    SpinCount:  INFINITE;
+    DelayCount: 1000);
+
+  DefaultWaitParams: TFLWaitParams = (
+    Timeout:      INFINITE;
+    DelayMethod:  dmSpin;
+    SpinCount:    1000;
+    DelayCount:   5000);
+
+//------------------------------------------------------------------------------
+{
+  TFLWaitResult
+
+  Used to indicate result of blocking (spinning or waiting) functions.
+
+    wrAcquired - The synchronizer object was signaled (unlocked). Current state
+                 of the synchronizer object depends on its type and settings.
+
+    wrTimeout  - Spinning or waiting timed-out, ie. the synchronizer did
+                 not became signaled in a given timeout period or number
+                 of spinning cycles (was non-signaled the whole time).
+
+    wrTryAgain - Returned when the synchronizer is in a state that temporarily
+                 precludes spinning or waiting (for example when event is
+                 pulsing or there is too many threads already waiting).
+                 You should try to aquire the synchronizer again later.
 
     wrError    - Unknown or external error has ocurred, the object might be in
                  an inconsistent state and should not be used anymore.
+                 In current implementation, this is never returned as all
+                 erroneous states lead to an exception being raised.
 }
-  TFLWaitResult = (wrAcquired,wrTimeout,wrReserved,wrError);
+type
+  TFLWaitResult = (wrAcquired,wrTimeout,wrTryAgain,wrError);
 
 {
-  In waiting, the function blocks by executing a cycle. Each iteration of this
-  cycle contains a try to acquire the lock, a check for timeout and a delaying
-  part that prevents rapid calls to acquire and timers.
+  WaitResultToStr
 
-  TFLWaitDelayMethod enumeration is here to select a method used for this
-  delaying.
+  Resturns textual representation of provided wait result.
 
-    wdNone        No delaying action is performed.
-
-    wdSpin        A spinning will be performed. This is the default operation.
-
-    wdYield       An attempt to yield execution of current thread is made.
-                  If system has another thread that can be run, the current
-                  thread is suspended, rescheduled and the next thread is run.
-                  If there is no thread awaiting execution, then the current
-                  thread is not suspended and continues execution and pretty
-                  much performs spinning.
-
-                    WARNING - use with caution, as it can cause spinning with
-                              rapid calls to thread yielding on uncontested CPU.
-
-    wdSleep       The current thread stops execution (call to Sleep) for no
-                  less than 10ms. Note that this time might actually be longer
-                  because of granularity of scheduling timers, resulting in
-                  slightly longer wait time than is requested.
-
-    wdSleepEx     Behaves the same as wdSleep, but the thread can be awakened
-                  by APC or I/O completion calls.
-
-                    NOTE - works only on Windows, everywhere else it behaves
-                           the same as wdSleep.
-
-    wdYieldSleep  Combination od wdYield and wdSleep - when the thread is not
-                  yielded (eg. because no thread is waiting execution), a sleep
-                  is performed.
-
-                    NOTE - works only on Windows, everywhere else it behaves
-                           the same as wdSleep.
+  It is inteded mainly for debugging purposes.
 }
-  TFLWaitDelayMethod = (wdNone,wdSpin,wdYield,wdSleep,wdSleepEx,wdYieldSleep);
+Function WaitResultToStr(WaitResult: TFLWaitResult): String;
 
 {===============================================================================
 --------------------------------------------------------------------------------
                                     TFastLock
 --------------------------------------------------------------------------------
 ===============================================================================}
+type
+  TFastLockMode = (flmOwner,flmSlave,flmWrapper);
+
 {===============================================================================
     TFastLock - class declaration
 ===============================================================================}
+{
+  TFastLock
+
+  TFastLock is a common ancestor for all classes implemented by this library
+  that are encapsulating procedural interfaces of provided synchronization
+  primitives into object forms.
+
+  These objects can be created in three principial modes - Owner, Slave and
+  Wrapper.
+
+    Owner object uses its own internal field to provide sync word and therefore
+    does not need it to be allocated or declared externally. You simply create
+    it using no-parameter constructor and that is all
+
+      NOTE - some synchronizers may provide constructors accepting parameters
+             that specify properties of that primitive. Simply put, owner mode
+             object is created when you use constructor that does NOT expect
+             sync word variable or other (master) instance of TFastLock or its
+             descendant.  
+
+    Slave object does not have its own sync word, instead it uses sync word
+    provided by master object passed to constructor. This mechanism is here to
+    allow for effective sharing of one lock between multiple instances of fast
+    lock objects - you create owner object in one (possibly main) thread and
+    to synchronize in other threads you just give them slave objects created
+    using the owner object as their master. Also note that the master object
+    does not need to be created in owner mode - it can be another slave or
+    even wrapper instance (yep, you can create a tree of slaves, but better
+    avoid that).
+
+      WARNING - to ensure that master objects are not destroyed while being
+                used by their slaves, all objects are reference counted.
+                Everytime any instance is used as master, its reference count
+                is incremented and, when the slave object is destroyed it gets
+                decremented.
+                If you call destructor of object that is currently being used
+                as master, it will not be freed within that call, only its
+                reference count will be decremented. When last slave using it
+                is being destroyed, this master will be destroyed too.
+
+    Wrapper object also does not have its own sync word, but instead of using
+    master object it accepts reference to any sync word wariable and uses that
+    one. Lifetime of this variable must be managed by external means. You can
+    use single variable in any number of wrapper instances, they will all be
+    mutually synchronized.
+    The variable can be initialized and finalized externally, but if you set
+    constructor parameter InitSyncWord to True, the object will automatically
+    initialize and also finalize it - be carefull and make sure you do not
+    re-initialize already used sync word.
+}
 type
   TFastLock = class(TCustomObject)
   protected
+    fMode:            TFastLockMode;
+    fRefCount:        Integer;
+    fMaster:          TFastLock;
     fSyncWord:        TFLSyncWord;
     fSyncWordPtr:     PFLSyncWord;
-    fOwnsSyncWord:    Boolean;
-    fWaitDelayMethod: UInt32;
-    fWaitSpinCount:   UInt32;
-    fSpinDelayCount:  UInt32;
-    fCounterFreq:     Int64;
-    Function GetWaitDelayMethod: TFLWaitDelayMethod; virtual;
-    procedure SetWaitDelayMethod(Value: TFLWaitDelayMethod); virtual;
-    Function GetWaitSpinCount: UInt32; virtual;
-    procedure SetWaitSpinCount(Value: UInt32); virtual;
-    Function GetSpinDelayCount: UInt32; virtual;
-    procedure SetSpinDelayCount(Value: UInt32); virtual;
-    procedure Initialize(SyncWordPtr: PFLSyncWord); virtual;
+    fInitializer:     Boolean;
+    fClockFreq:       Int64;
+    fSpinParams:      TFLSpinParams;
+    fWaitParams:      TFLWaitParams;
+    fCanFreeInstance: Boolean;
+    Function GetReferenceCount: Integer; virtual;
+    Function AcquireReference: Integer; virtual;
+    Function ReleaseReference: Integer; virtual;
+    procedure SyncWordInit(const InitArgs: array of const); virtual; abstract;
+    procedure SyncWordFinal; virtual; abstract;
+    procedure Initialize(SyncWordPtr: PFLSyncWord; InitSyncWord: Boolean; const InitArgs: array of const); virtual;
     procedure Finalize; virtual;
+    class Function ArgTypePresent(const InitArgs: array of const; Index: Integer; VType: Byte): Boolean; virtual;
   public
-    constructor Create(var SyncWord: TFLSyncWord); overload; virtual;
+    procedure FreeInstance; override;
+    constructor CreateBase; // static constructor
     constructor Create; overload; virtual;
+    constructor Create(Master: TFastLock); overload; virtual;    
+    constructor Create(var SyncWord: TFLSyncWord; InitSyncWord: Boolean = True); overload; virtual;
     destructor Destroy; override;
-    property OwnsSyncWord: Boolean read fOwnsSyncWord;
-    property WaitDelayMethod: TFLWaitDelayMethod read GetWaitDelayMethod write SetWaitDelayMethod;
-    property WaitSpinCount: UInt32 read GetWaitSpinCount write SetWaitSpinCount;
-    property SpinDelayCount: UInt32 read GetSpinDelayCount write SetSpinDelayCount;
+    property Mode: TFastLockMode read fMode;    
+    property ReferenceCount: Integer read GetReferenceCount;
+    property Initializer: Boolean read fInitializer;
+    property ClockFrequency: Int64 read fClockFreq;
+    property SpinParams: TFLSpinParams read fSpinParams write fSpinParams;
+    property WaitParams: TFLWaitParams read fWaitParams write fWaitParams;
   end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                   Fast event                                   
+--------------------------------------------------------------------------------
+===============================================================================}
+{
+  Synchronizer that roughly corresponds to events provided by Windows OS (see
+  their documentation for details on how and where to use events).
+
+  It is an object whose state can be explicitly manipulated (set to signaled
+  or reset to non-signaled) from any thread and which can be used eg. to inform
+  other threads that some event has occurred/passed.
+
+  Note that current implementation actually presents three possible states
+  for the event - signaled, non-signaled and pulsing (non-signaled state that
+  allows currently blocked threads to pass).
+
+  For more information, refer to description of individual functions.
+}
+{===============================================================================
+    Fast event - procedural interface declaration
+===============================================================================}
+{
+  FastEventInit
+
+  Initializes the event synchronizer and sets its state according to passed
+  settings.
+
+  If InitialState is set to True, then the state of initialized event will
+  be signaled, otherwise (False) it will be non-signaled.
+
+  For details about manual-reset versus auto-reset, please refer to description
+  of FastEvent*Pass functions.
+
+  If already initialized word is passed here, it will be re-initialized and
+  its current state lost.
+}
+procedure FastEventInit(out SyncWord: TFLSyncWord; ManualReset: Boolean = False; InitialState: Boolean = False);
+
+{
+  FastEventFinal
+
+  Finalizes the event object and sets sync word to a value that precludes its
+  further use (an invalid value). Can accept uninitialized sync words.
+
+  If any thread is spinning or waiting on this word, the spin or wait function
+  will raise an EFLInvalidState exception next time it probes the event (next
+  cycle).
+}
+procedure FastEventFinal(var SyncWord: TFLSyncWord);
+
+{
+  FastEventSet
+
+  Sets the event to signaled state.
+
+  If the event is currently pulsing, the pulsing is abandoned.
+
+  Raises an EFLInvalidState exception if the sync word is not initialized or
+  has invalid value in general.
+}
+procedure FastEventSet(var SyncWord: TFLSyncWord);
+
+{
+  FastEventReset
+
+  Resets the event to non-signaled state.
+
+  If the event is currently pulsing, the pulsing is abandoned.
+
+  Raises an EFLInvalidState exception if the sync word is not initialized or
+  has invalid value in general.
+}
+procedure FastEventReset(var SyncWord: TFLSyncWord);
+
+{
+  FastEventPulse
+
+  If no thread is spinning or waiting on this event, then it is reset to a
+  non-signaled state (equivalent to calling FastEventReset). If any thread
+  is spinning or waiting, then the event is set to pulsing state.
+
+    In pulsing state, threads that were already spinning or waiting (and only
+    those threads) are allowed to pass the event. If it is an auto-reset event,
+    then first thread that passes sets it to a non-signaled state, disabling
+    pulsing. For manual-reset event, only when last of the spinning or waiting
+    threads passes the event is reset to non-signaled state.
+    
+    During pulsing, no new thread can pass it or begin spinning or waiting
+    (wrTryLater will be returned).
+
+  Raises an EFLInvalidState exception if the sync word is not initialized or
+  has invalid value in general.
+}
+procedure FastEventPulse(var SyncWord: TFLSyncWord);
+
+{
+  FastEventPass
+
+  Probes the provided event whether it passed or not.
+
+    For auto-reset events, the call passes (true is returned) when the event
+    is in a signaled state (note that pulsing event is NOT signaled), and no
+    other thread is spinning or waiting on it - this is to ensure that blocked
+    threads are served as soon as possible and are not starved by asynchronous
+    passes. Also, if passed, then the event is reset to non-signaled state,
+    otherwise its state is left unchanged.
+
+    Manual-reset event can be passed whenever it is in a signaled state.
+
+  Raises an EFLInvalidState exception if the sync word is not initialized or
+  has invalid value in general.
+}
+Function FastEventPass(var SyncWord: TFLSyncWord): Boolean;
+
+{
+  FastEventSpinToPass
+
+  Tries to pass the event and, if not successful, enters spinning. The spinning
+  ends when the event can be passed (becomes signaled or pulsing) or prescribed
+  number of spinning cycles (SpinCount) is performed - note that SpinCount can
+  be set to INFINITE, in which case spinning will never terminate by running
+  out of cycles.
+
+  If the event becomes signaled or pulsing during waiting, or if it is passed
+  without even starting spinning, then wrAcquired is returned.
+
+  If the function exits because number of prescribed cycles elapses, then
+  wrTimeout is returned.
+
+  It can also return wrTryAgain - this happens either because the event was in
+  pulsing state, which precludes new threads to start spinning or waiting on
+  it, or because internal counter that tracks number of currently spinning or
+  waiting threads reached its maximum (1023 in current implementation). In any
+  case, you should try spinning again after some time.
+
+  Overload accepting SpinParams instead of just SpinCount is here to allow for
+  finer control over the spinning (more parameters can be varied).
+
+  Raises an EFLInvalidState exception if the sync word is not initialized or
+  has invalid value in general.
+}
+Function FastEventSpinToPass(var SyncWord: TFLSyncWord; SpinParams: TFLSpinParams): TFLWaitResult; overload;
+Function FastEventSpinToPass(var SyncWord: TFLSyncWord; SpinCount: UInt32): TFLWaitResult; overload;
+
+{
+  FastEventWaitToPass
+
+  Works exactly the same as FastEventSpinToPass (see there for details), but,
+  instead of spinning, it will enter waiting. Time that can be spent waiting
+  is not given by number of cycles, but by number of milliseconds (Timeout).
+
+  This type of blocking is here to allow for better control over the time spent,
+  because how much actual time is spent in spinning greatly depends on system
+  performance (eg. CPU clock, instruction troughput and latency, optimizations
+  of used instructions, exact behaviour of PAUSE instruction, you name it...).
+
+  See description of types TFLWaitDelayMethod and TFLWaitParams for more
+  information regarding waiting.
+
+    NOTE - waiting is, similarly to spinning, active, meaning the thread will
+           still run and load the processor and not enter any kind of suspended
+           state (unless in some specific delay methods, see description of
+           TFLWaitDelayMethod for details).
+}
+Function FastEventWaitToPass(var SyncWord: TFLSyncWord; WaitParams: TFLWaitParams): TFLWaitResult; overload;
+Function FastEventWaitToPass(var SyncWord: TFLSyncWord; Timeout: UInt32): TFLWaitResult; overload;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                   TFastEvent
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TFastEvent - class declaration
+===============================================================================}
+type
+  TFastEvent = class(TFastLock)
+  protected
+    procedure SyncWordInit(const InitArgs: array of const); override;
+    procedure SyncWordFinal; override;
+  public
+    constructor Create(ManualReset: Boolean; InitialState: Boolean); overload; virtual;
+    // following overload WILL initialize the provided sync word
+    constructor Create(var SyncWord: TFLSyncWord; ManualReset: Boolean; InitialState: Boolean); overload; virtual;
+  {
+    Unfortunatelly, "set" is a reserved word in pascal, therefore it cannot be
+    used as method name. I chose to rename it to EventSet, and to keep naming
+    scheme, all methods in TFastLock descendants will be named similarly.
+  }
+    procedure EventSet; virtual;
+    procedure EventReset; virtual;
+    procedure EventPulse; virtual;
+    Function EventPass: Boolean; virtual;
+    Function EventSpinToPass(SpinCount: UInt32): TFLWaitResult; overload; virtual;
+    Function EventSpinToPass: TFLWaitResult; overload; virtual;
+    Function EventWaitToPass(Timeout: UInt32): TFLWaitResult; overload; virtual;
+    Function EventWaitToPass: TFLWaitResult; overload; virtual;
+  end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 Fast semaphore
+--------------------------------------------------------------------------------
+===============================================================================}
+{$message 'todo: descriptions'}
+procedure FastSemaphoreInit(out SyncWord: TFLSyncWord; InitialCount: TFLSyncWord = 0);
+procedure FastSemaphoreFinal(var SyncWord: TFLSyncWord);
+
+Function FastSemaphoreCount(var SyncWord: TFLSyncWord): TFLSyncWord;
+
+Function FastSemaphoreAcquire(var SyncWord: TFLSyncWord; AcquireCount: TFLSyncWord = 1): Boolean;
+Function FastSemaphoreRelease(var SyncWord: TFLSyncWord; ReleaseCount: TFLSyncWord = 1): Boolean;
+
+Function FastSemaphoreSpinToAcquire(var SyncWord: TFLSyncWord; SpinParams: TFLSpinParams; AcquireCount: TFLSyncWord = 1): TFLWaitResult; overload;
+Function FastSemaphoreSpinToAcquire(var SyncWord: TFLSyncWord; SpinCount: UInt32; AcquireCount: TFLSyncWord = 1): TFLWaitResult; overload;
+
+Function FastSemaphoreWaitToAcquire(var SyncWord: TFLSyncWord; WaitParams: TFLWaitParams; AcquireCount: TFLSyncWord = 1): TFLWaitResult; overload;
+Function FastSemaphoreWaitToAcquire(var SyncWord: TFLSyncWord; Timeout: UInt32; AcquireCount: TFLSyncWord = 1): TFLWaitResult; overload;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 TFastSemaphore
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TFastSemaphore - class declaration
+===============================================================================}
+type
+  TFastSemaphore = class(TFastLock)
+  protected
+    procedure SyncWordInit(const InitArgs: array of const); override;
+    procedure SyncWordFinal; override;
+  public
+    constructor Create(InitialCount: TFLSyncWord); overload; virtual;
+    // following overload will initialize the provided sync word
+    constructor Create(var SyncWord: TFLSyncWord; InitialCount: TFLSyncWord); overload; virtual;
+    Function SemaphoreCount: TFLSyncWord; virtual;
+    Function SemaphoreAcquire(AcquireCount: TFLSyncWord = 1): Boolean; virtual;
+    Function SemaphoreRelease(ReleaseCount: TFLSyncWord = 1): Boolean; virtual;
+    Function SemaphoreSpinToAcquireBy(SpinCount: UInt32; AcquireCount: TFLSyncWord): TFLWaitResult; overload; virtual;
+    Function SemaphoreSpinToAcquireBy(AcquireCount: TFLSyncWord): TFLWaitResult; overload; virtual;
+    Function SemaphoreSpinToAcquire(SpinCount: UInt32): TFLWaitResult; overload; virtual; // acquire count is 1
+    Function SemaphoreSpinToAcquire: TFLWaitResult; overload; virtual;
+    Function SemaphoreWaitToAcquireBy(Timeout: UInt32; AcquireCount: TFLSyncWord): TFLWaitResult; overload; virtual;
+    Function SemaphoreWaitToAcquireBy(AcquireCount: TFLSyncWord): TFLWaitResult; overload; virtual;
+    Function SemaphoreWaitToAcquire(Timeout: UInt32): TFLWaitResult; overload; virtual;
+    Function SemaphoreWaitToAcquire: TFLWaitResult; overload; virtual;
+  end;
+(*
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -411,7 +846,7 @@ procedure FastCriticalSectionLeave(var SyncWord: TFLSyncWord);
 }
 
 Function FastCriticalSectionSpinToEnter(var SyncWord: TFLSyncWord; SpinCount: UInt32; SpinDelayCount: UInt32 = FL_DEF_SPIN_DELAY_CNT): TFLWaitResult;
-Function FastCriticalSectionWaitToEnter(var SyncWord: TFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin;
+Function FastCriticalSectionWaitToEnter(var SyncWord: TFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = dmSpin;
   WaitSpinCount: UInt32 = FL_DEF_WAIT_SPIN_CNT; SpinDelayCount: UInt32 = FL_DEF_SPIN_DELAY_CNT): TFLWaitResult;
 
 {===============================================================================
@@ -477,14 +912,14 @@ Function FastMREWBeginRead(var SyncWord: TFLSyncWord): Boolean;
 procedure FastMREWEndRead(var SyncWord: TFLSyncWord);
 
 Function FastMREWSpinToRead(var SyncWord: TFLSyncWord; SpinCount: UInt32; SpinDelayCount: UInt32 = FL_DEF_SPIN_DELAY_CNT): TFLWaitResult;
-Function FastMREWWaitToRead(var SyncWord: TFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin;
+Function FastMREWWaitToRead(var SyncWord: TFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = dmSpin;
   WaitSpinCount: UInt32 = FL_DEF_WAIT_SPIN_CNT; SpinDelayCount: UInt32 = FL_DEF_SPIN_DELAY_CNT): TFLWaitResult;
 
 Function FastMREWBeginWrite(var SyncWord: TFLSyncWord): Boolean;
 procedure FastMREWEndWrite(var SyncWord: TFLSyncWord);
 
 Function FastMREWSpinToWrite(var SyncWord: TFLSyncWord; SpinCount: UInt32; SpinDelayCount: UInt32 = FL_DEF_SPIN_DELAY_CNT): TFLWaitResult;
-Function FastMREWWaitToWrite(var SyncWord: TFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin;
+Function FastMREWWaitToWrite(var SyncWord: TFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = dmSpin;
   WaitSpinCount: UInt32 = FL_DEF_WAIT_SPIN_CNT; SpinDelayCount: UInt32 = FL_DEF_SPIN_DELAY_CNT): TFLWaitResult;
 
 {===============================================================================
@@ -513,26 +948,1381 @@ type
 
   // full-name alias
   TFastMultiReadExclusiveWriteSynchronizer = TFastMREW;
-
+*)
 implementation
 
 uses
-{$IFDEF Windows}
-  Windows,
-{$ELSE}
-  baseunix, linux,
-{$ENDIF}
+{$IFDEF Windows} Windows,{$ELSE} baseunix, linux,{$ENDIF}
   InterlockedOps;
 
-{$IFNDEF Windows}
-  {$LINKLIB C}
-{$ENDIF}
+{.$IFNDEF Windows}
+  {.$LINKLIB C}
+{.$ENDIF}
 
 {$IFDEF FPC_DisableWarns}
   {$DEFINE FPCDWM}
   {$DEFINE W5024:={$WARN 5024 OFF}} // Parameter "$1" not used
 {$ENDIF}
 
+Function ConsumeArg(Arg: TFLSyncWord): TFLSyncWord;
+begin
+Result := Arg + 0;
+end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                   Fast locks
+--------------------------------------------------------------------------------
+===============================================================================}
+const
+  FL_INITVAL = TFLSyncWord(0);
+
+  FL_WORDHIBIT = {$IFDEF SyncWord64}63{$ELSE}31{$ENDIF};
+
+  FL_COMMON_MASK_VALID = TFLSyncWord(1) shl FL_WORDHIBIT;
+
+//------------------------------------------------------------------------------
+
+Function IsValid(SyncWord: TFLSyncWord): Boolean;{$IFDEF CanInline} inline;{$ENDIF}
+begin
+Result := (SyncWord and FL_COMMON_MASK_VALID) <> 0;
+end;
+
+//------------------------------------------------------------------------------
+
+Function WaitResultToStr(WaitResult: TFLWaitResult): String;
+const
+  WR_STRS: array[TFLWaitResult] of String = ('Acquired','Timeout','TryAgain','Error');
+begin
+If (WaitResult >= Low(TFLWaitResult)) and (WaitResult <= High(TFLWaitResult)) then
+  Result := WR_STRS[WaitResult]
+else
+  Result := '<invalid>';
+end;
+
+{===============================================================================
+    Fast locks - spinning and waiting infrastructure
+===============================================================================}
+type
+  TFLQueueResult = (qrAcquired,qrQueued,qrFailed);
+
+type
+  TFLWaitParamsInternal = record
+    PublicParams:     record case Boolean of
+      False: (SpinParams: TFLSpinParams);
+      True:  (WaitParams: TFLWaitParams;
+              ClockStart: Int64;
+              ClockFreq:  Int64);
+    end;
+    SyncWordPtr:      PFLSyncWord;
+    EnqueueFce:       Function(var SyncWord: TFLSyncWord; CallData: TFLSyncWord): TFLQueueResult;
+    QueuedAcquireFce: Function(var SyncWord: TFLSyncWord; CallData: TFLSyncWord): Boolean;
+    DequeueFce:       procedure(var SyncWord: TFLSyncWord; CallData: TFLSyncWord);
+    CallData:         TFLSyncWord;  // passed as CallData param to above funtions
+  end;
+
+//==============================================================================
+{
+  Just do some contained, relatively long, but othervise pointless operation
+  that has no side effects.
+}
+Function SpinDelayAction(Divisor: UInt32): UInt32;{$IFNDEF PurePascal} register; assembler;
+asm
+{
+  Assembly implementation is here only to utilize PAUSE instruction. It is
+  otherwise equivalent to pascal code.
+}
+{$IFDEF x64}
+  {$IFDEF Windows}
+    // Divisor is already in ECX
+  {$ELSE}
+    MOV     ECX, EDI
+  {$ENDIF}
+{$ELSE}
+    MOV     ECX, EAX
+{$ENDIF}
+    MOV     EAX, 3895731025
+    XOR     EDX, EDX
+
+    DIV     ECX
+
+    PAUSE   // instruction specifically intended for spin loops
+end;
+{$ELSE}
+begin
+Result := UInt32(3895731025) div Divisor;
+end;
+{$ENDIF}
+
+//------------------------------------------------------------------------------
+
+procedure SpinDelay(Count: UInt32);
+var
+  i:  UInt32;
+begin
+{
+  Repeatedly call delaying action - iterator must not start at 0 because it is
+  used as divisor in SpinDelayAction.
+}
+For i := 1 to Count do
+  SpinDelayAction(i);
+end;
+
+//------------------------------------------------------------------------------
+
+Function GetClockFrequency(out Freq: Int64): Boolean;
+{$IFNDEF Windows}
+var
+  Time: TTimeSpec;
+{$ENDIF}
+begin
+{$IFDEF Windows}
+Freq := 0;
+Result := QueryPerformanceFrequency(Freq);
+{$ELSE}
+Freq := 1000000000{ns^-1, 1GHz};
+Result := clock_getres(CLOCK_MONOTONIC_RAW,@Time) = 0;
+{$ENDIF}
+If Freq and Int64($1000000000000000) <> 0 then
+  raise EFLClockError.CreateFmt('GetClockFrequency: Unsupported frequency value (0x%.16x)',[Freq]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function GetClockValue(out Count: Int64): Boolean;
+{$IFNDEF Windows}
+var
+  Time: TTimeSpec;
+{$ENDIF}
+begin
+{$IFDEF Windows}
+Count := 0;
+Result := QueryPerformanceCounter(Count);
+{$ELSE}
+Result := clock_gettime(CLOCK_MONOTONIC_RAW,@Time) = 0;
+Count := Int64(Time.tv_sec) * 1000000000 + Int64(Time.tv_nsec);
+{$ENDIF}
+// mask out bit 63 to prevent problems with signed 64bit integer
+Count := Count and Int64($7FFFFFFFFFFFFFFF);
+end;
+
+//------------------------------------------------------------------------------
+
+Function GetElapsedMillis(FromClock,Frequency: Int64): UInt32;
+var
+  CurrentClock: Int64;
+begin
+If GetClockValue(CurrentClock) then
+  begin
+    If CurrentClock < FromClock then
+      // clock seems to have overflown
+      Result := UInt32(((High(Int64) - FromClock + CurrentClock + 1{overflow tick}) * 1000) div Frequency)
+    else
+      Result := UInt32(((CurrentClock - FromClock) * 1000) div Frequency);
+  end
+else raise EFLClockError.Create('GetElapsedMillis: Unable to obtain clock value');
+end;
+
+//------------------------------------------------------------------------------
+
+{$IFDEF Windows}
+Function SwitchToThread: BOOL; stdcall; external kernel32;
+{$ELSE}
+{
+  FPC declares sched_yield as procedure without result, which afaik does not
+  correspond to linux man.
+}
+Function sched_yield: cint; cdecl; external;
+{$ENDIF}
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function YieldThread: Boolean;{$IFDEF CanInline} inline;{$ENDIF}
+begin
+{$IFDEF Windows}
+Result := SwitchToThread;
+{$ELSE}
+Result := sched_yield = 0;
+{$ENDIF}
+end;
+
+{===============================================================================
+    Fast locks - spinning and waiting implementation
+===============================================================================}
+
+Function ExecuteSpinning(WaitParamsInternal: TFLWaitParamsInternal): TFLWaitResult;
+
+  Function SpinInternal: TFLWaitResult;
+  begin
+    // SpinInternal can only return wrAcquired or wrTimeout, nothing else
+    while not WaitParamsInternal.QueuedAcquireFce(WaitParamsInternal.SyncWordPtr^,WaitParamsInternal.CallData) do
+      begin
+      {
+        Could not acquire the object - do spinning, check count and exit or
+        repeat, depending on counters.
+      }
+        SpinDelay(WaitParamsInternal.PublicParams.SpinParams.DelayCount);
+        If WaitParamsInternal.PublicParams.SpinParams.SpinCount <> INFINITE then
+          begin
+            Dec(WaitParamsInternal.PublicParams.SpinParams.SpinCount);
+            If WaitParamsInternal.PublicParams.SpinParams.SpinCount <= 0 then
+              begin
+                // we must explicitly dequeue
+                WaitParamsInternal.DequeueFce(WaitParamsInternal.SyncWordPtr^,WaitParamsInternal.CallData);
+                Result := wrTimeout;
+                Exit;
+              end;
+          end;
+      end;
+    // if here, acquire was successful
+    Result := wrAcquired;
+  end;
+
+begin
+case WaitParamsInternal.EnqueueFce(WaitParamsInternal.SyncWordPtr^,WaitParamsInternal.CallData) of
+  qrAcquired: Result := wrAcquired;
+  qrQueued:   Result := SpinInternal;
+else
+ {qrFailed}   Result := wrTryAgain;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function ExecuteWaiting(WaitParamsInternal: TFLWaitParamsInternal): TFLWaitResult;
+
+  Function WaitInternal: TFLWaitResult;
+  begin
+    while not WaitParamsInternal.QueuedAcquireFce(WaitParamsInternal.SyncWordPtr^,WaitParamsInternal.CallData) do
+      with WaitParamsInternal.PublicParams do
+        If (WaitParams.Timeout = INFINITE) or (GetElapsedMillis(ClockStart,ClockFreq) < WaitParams.Timeout) then
+          // infinite wait or timeout has not elapsed yet
+          case WaitParams.DelayMethod of
+            dmNone:;        // do nothing
+            dmYield:        YieldThread;
+          {$IFDEF Windows}
+            dmSleep:        Sleep(WaitParams.SleepTime);
+            dmSleepEx:      SleepEx(WaitParams.SleepTime,True);
+            dmYieldSleep:   If not YieldThread then
+                              Sleep(WaitParams.SleepTime);
+            dmYieldSleepEx: If not YieldThread then
+                              SleepEx(WaitParams.SleepTime,True);
+          {$ELSE}
+            dmSleep,
+            dmSleepEx,
+            dmYieldSleep,
+            dmYieldSleepEx: Sleep(WaitParams.SleepTime);
+          {$ENDIF}
+          else
+           {dmSpin}
+          {
+            Perform spinning similarly to ExecuteSpinning but without queueing
+            as we are already queued for waiting. Ignore INFINITE spin count
+            here.
+          }
+            while WaitParams.SpinCount > 0 do
+              begin
+                SpinDelay(WaitParams.SpinCount);
+                Dec(WaitParams.SpinCount);
+              end;
+          end
+        else
+          begin
+            // not in infinite wait and timeout has elapsed
+            WaitParamsInternal.DequeueFce(WaitParamsInternal.SyncWordPtr^,WaitParamsInternal.CallData);
+            Result := wrTimeout;
+            Exit;
+          end;
+    Result := wrAcquired;
+  end;
+
+begin
+case WaitParamsInternal.EnqueueFce(WaitParamsInternal.SyncWordPtr^,WaitParamsInternal.CallData) of
+  qrAcquired: Result := wrAcquired;
+  qrQueued:   Result := WaitInternal;
+else
+ {qrFailed}   Result := wrTryAgain;
+end;
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                    TFastLock
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TFastLock - class declaration
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TFastLock - protected methods implementation
+-------------------------------------------------------------------------------}
+
+Function TFastLock.GetReferenceCount: Integer;
+begin
+Result := InterlockedLoad(fRefCount);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TFastLock.AcquireReference: Integer;
+begin
+Result := InterlockedIncrement(fRefCount);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TFastLock.ReleaseReference: Integer;
+begin
+Result := InterlockedDecrement(fRefCount);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TFastLock.Initialize(SyncWordPtr: PFLSyncWord; InitSyncWord: Boolean; const InitArgs: array of const);
+begin
+// do not touch reference counter
+InterlockedStore(fSyncWord,FL_INITVAL);
+fSyncWordPtr := SyncWordPtr;
+fInitializer := InitSyncWord;
+If fInitializer then
+  SyncWordInit(InitArgs);
+If not GetClockFrequency(fClockFreq) then
+  raise EFLClockError.Create('TFastLock.Initialize: Cannot obtain counter frequency.');
+fSpinParams := DefaultSpinParams;
+fWaitParams := DefaultWaitParams;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TFastLock.Finalize;
+begin
+If fInitializer then
+  SyncWordFinal;
+end;
+
+//------------------------------------------------------------------------------
+
+class Function TFastLock.ArgTypePresent(const InitArgs: array of const; Index: Integer; VType: Byte): Boolean;
+begin
+Result := False;
+If Length(InitArgs) > Index then
+  Result := VType = InitArgs[Index].VType;
+end;
+
+{-------------------------------------------------------------------------------
+    TFastLock - public methods implementation
+-------------------------------------------------------------------------------}
+
+procedure TFastLock.FreeInstance;
+begin
+If fCanFreeInstance then
+  inherited FreeInstance;
+end;
+
+//------------------------------------------------------------------------------
+
+constructor TFastLock.CreateBase;
+begin
+inherited Create;
+end;
+
+//------------------------------------------------------------------------------
+
+constructor TFastLock.Create;
+begin
+CreateBase;
+fMode := flmOwner;
+Initialize(@fSyncWord,True,[]);
+AcquireReference;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TFastLock.Create(Master: TFastLock);
+begin
+CreateBase;
+fMode := flmSlave;
+If not (Master is Self.ClassType) then
+  raise EFLInvalidValue.CreateFmt('TFastLock.Create: Master object is of incompatible class (%s).',[Master.ClassName]);
+fMaster := Master;
+If fMaster.AcquireReference <= 1 then
+  raise EFLInvalidState.Create('TFastLock.Create: Master object is being destroyed.');
+Initialize(fMaster.fSyncWordPtr,False,[]);  
+AcquireReference;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TFastLock.Create(var SyncWord: TFLSyncWord; InitSyncWord: Boolean = True);
+begin
+CreateBase;
+fMode := flmWrapper;
+Initialize(@SyncWord,InitSyncWord,[]);
+AcquireReference;
+end;
+
+//------------------------------------------------------------------------------
+
+destructor TFastLock.Destroy;
+begin
+{
+  FreeInstance is called at the end of this function, but we need to suppress
+  it if we are not actually freeing - fCanFreeInstance is used for that and
+  method FreeInstance is overriden to check its value.
+}
+fCanFreeInstance := ReleaseReference <= 0;
+If fCanFreeInstance then
+  begin
+    Finalize;
+    If (fMode = flmSlave) and Assigned(fMaster) then
+      If fMaster.ReleaseReference <= 0 then
+        FreeAndNil(fMaster);
+    inherited Destroy;
+  end;
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                   Fast event                                   
+--------------------------------------------------------------------------------
+===============================================================================}
+{
+      Hi  ... highest bit in the sync word (31 for 32bit words and 63 for
+              64bit words)
+      <x> ... immutable bits (set in initialization and then only read, usually
+              used for lock settings)
+
+  Following is a specification of bits and fields in sync word for fast events
+  in current implementation (note that it can be changed without warning in
+  future revisions, so do not depend on it):
+
+           Hi      - (V) validity bit, must be 1
+           Hi-1    - (L) lock bit (0 signaled, 1 non signaled)
+           Hi-2    - (P) pulsing (0 not pulsing, 1 pulsing)
+          <Hi-3>   - (M) manual reset (0 auto reset, 1 manual reset)
+     10 .. Hi-4    -     unused
+      0 .. 9       - (W) wait counter (max 1023 waiters)
+}
+const
+  FL_EVENT_MASK_VALID       = FL_COMMON_MASK_VALID;
+  FL_EVENT_MASK_LOCK        = TFLSyncWord(1) shl (FL_WORDHIBIT - 1);
+  FL_EVENT_MASK_PULSING     = TFLSyncWord(1) shl (FL_WORDHIBIT - 2);
+  FL_EVENT_MASK_MANUALRESET = TFLSyncWord(1) shl (FL_WORDHIBIT - 3);
+  FL_EVENT_MASK_WAITCOUNTER = (TFLSyncWord(1) shl 10) - 1;
+
+  FL_EVENT_IOPRES_INVALID = -1;
+  FL_EVENT_IOPRES_SUCCESS = 0;
+  FL_EVENT_IOPRES_LOCKED  = 1;
+  FL_EVENT_IOPRES_PULSING = 2;
+  FL_EVENT_IOPRES_WAITERS = 3;
+  FL_EVENT_IOPRES_QUEUED  = 4;
+
+{===============================================================================
+    Fast event - internal functions implementation
+===============================================================================}
+
+Function FastEventResetIOP(var SyncWord: TFLSyncWord): TFLSyncWord; register;
+begin
+// L := 1,  P := 0
+If (SyncWord and FL_EVENT_MASK_VALID) <> 0 then
+  begin
+    SyncWord := (SyncWord or FL_EVENT_MASK_LOCK) and not FL_EVENT_MASK_PULSING;
+    Result := FL_EVENT_IOPRES_SUCCESS;
+  end
+else Result := FL_EVENT_IOPRES_INVALID;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastEventPulseIOP(var SyncWord: TFLSyncWord): TFLSyncWord; register;
+begin
+// L := 1,  P := (W <> 0)
+If (SyncWord and FL_EVENT_MASK_VALID) <> 0 then
+  begin
+    If (SyncWord and FL_EVENT_MASK_WAITCOUNTER) <> 0 then
+      SyncWord := SyncWord or (FL_EVENT_MASK_LOCK or FL_EVENT_MASK_PULSING)
+    else
+      SyncWord := (SyncWord or FL_EVENT_MASK_LOCK) and not FL_EVENT_MASK_PULSING;
+    Result := FL_EVENT_IOPRES_SUCCESS;
+  end
+else Result := FL_EVENT_IOPRES_INVALID;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastEventPassIOP(var SyncWord: TFLSyncWord): TFLSyncWord; register;
+begin
+If (SyncWord and FL_EVENT_MASK_VALID) <> 0 then
+  begin
+    If (SyncWord and FL_EVENT_MASK_LOCK) = 0 then
+      begin
+        // event is signaled (unlocked)
+        If (SyncWord and FL_EVENT_MASK_PULSING) = 0 then
+          begin
+            // so, are there any waiters?
+            If (SyncWord and FL_EVENT_MASK_WAITCOUNTER) = 0 then
+              begin
+                // no waiters, manage auto-reset and report success
+                If (SyncWord and FL_EVENT_MASK_MANUALRESET) = 0 then
+                  SyncWord := SyncWord or FL_EVENT_MASK_LOCK;
+                Result := FL_EVENT_IOPRES_SUCCESS;
+              end
+          {
+            There are waiters. We can pass only if this is manual-reset event
+            (waiters have precedence over us and we would block them in auto-
+            reset event).
+          }
+            else If (SyncWord and FL_EVENT_MASK_MANUALRESET) <> 0 then
+              Result := FL_EVENT_IOPRES_SUCCESS
+            else
+              Result := FL_EVENT_IOPRES_WAITERS;
+          end
+        // if L = 0, then P must also be 0
+        else Result := FL_EVENT_IOPRES_INVALID;
+      end
+    // locked - we have failed in any case, but report if pulsing
+    else If (SyncWord and FL_EVENT_MASK_PULSING) <> 0 then
+      Result := FL_EVENT_IOPRES_PULSING
+    else
+      Result := FL_EVENT_IOPRES_LOCKED;
+  end
+else Result := FL_EVENT_IOPRES_INVALID;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastEventEnqueueIOP(var SyncWord: TFLSyncWord): TFLSyncWord; register;
+begin
+If (SyncWord and FL_EVENT_MASK_VALID) <> 0 then
+  begin
+    If (SyncWord and FL_EVENT_MASK_LOCK) = 0 then
+      begin
+        // event is signaled, we can actually pass it
+        If (SyncWord and FL_EVENT_MASK_PULSING) = 0 then
+          begin
+            // no need to check for waiters, we are waiter
+            If (SyncWord and FL_EVENT_MASK_MANUALRESET) = 0 then
+              SyncWord := SyncWord or FL_EVENT_MASK_LOCK;
+            Result := FL_EVENT_IOPRES_SUCCESS;
+          end
+        else Result := FL_EVENT_IOPRES_INVALID;
+      end
+    else
+      begin
+        // event is non-signaled (locked), add us to the queue
+        If (SyncWord and FL_EVENT_MASK_PULSING) = 0 then
+          begin
+            If (SyncWord and FL_EVENT_MASK_WAITCOUNTER) < FL_EVENT_MASK_WAITCOUNTER then
+              begin
+                Inc(SyncWord);
+                Result := FL_EVENT_IOPRES_QUEUED;
+              end
+            else Result := FL_EVENT_IOPRES_WAITERS;
+          end
+        // cannot enqueue if the event is pulsing
+        else Result := FL_EVENT_IOPRES_PULSING;
+      end;
+  end
+else Result := FL_EVENT_IOPRES_INVALID;  
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastEventQueuedAcquireIOP(var SyncWord: TFLSyncWord): TFLSyncWord; register;
+begin
+// this can only be called after successfull queueing
+If ((SyncWord and FL_EVENT_MASK_VALID) <> 0) and ((SyncWord and FL_EVENT_MASK_WAITCOUNTER) <> 0) then
+  begin
+    If (SyncWord and FL_EVENT_MASK_LOCK) = 0 then
+      begin
+        If (SyncWord and FL_EVENT_MASK_PULSING) = 0 then
+          begin
+            If (SyncWord and FL_EVENT_MASK_MANUALRESET) = 0 then
+              SyncWord := SyncWord or FL_EVENT_MASK_LOCK;
+            // dequeue  
+            Dec(SyncWord);
+            Result := FL_EVENT_IOPRES_SUCCESS;
+          end
+        else Result := FL_EVENT_IOPRES_INVALID;
+      end
+    else
+      begin
+        // non-signaled, as we are already queued, we can potentially pass on pulsing
+        If (SyncWord and FL_EVENT_MASK_PULSING) <> 0 then
+          begin
+            // pulsing event, we are queued so it is in effect for us too, but first dequeue
+            Dec(SyncWord);
+            If (SyncWord and FL_EVENT_MASK_MANUALRESET) <> 0 then
+              begin
+                // manual-reset event, end pulsing only if no other thread is waiting
+                If (SyncWord and FL_EVENT_MASK_WAITCOUNTER) = 0 then
+                  SyncWord := (SyncWord or FL_EVENT_MASK_LOCK) and not FL_EVENT_MASK_PULSING;
+              end
+            // auto-reset event, end pulsing now and reset state
+            else SyncWord := (SyncWord or FL_EVENT_MASK_LOCK) and not FL_EVENT_MASK_PULSING;
+            Result := FL_EVENT_IOPRES_SUCCESS;
+          end
+        else Result := FL_EVENT_IOPRES_LOCKED;
+      end;
+  end
+else Result := FL_EVENT_IOPRES_INVALID;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastEventDequeueIOP(var SyncWord: TFLSyncWord): TFLSyncWord; register;
+begin
+// must only be called after successfull queueing
+If ((SyncWord and FL_EVENT_MASK_VALID) <> 0) and ((SyncWord and FL_EVENT_MASK_WAITCOUNTER) <> 0) then
+  begin
+    // just dequeue, ignore everything else
+    Dec(SyncWord);
+    Result := FL_EVENT_IOPRES_SUCCESS;
+  end
+else Result := FL_EVENT_IOPRES_INVALID;
+end;
+
+//==============================================================================
+
+Function FastEventEnqueue(var SyncWord: TFLSyncWord; CallData: TFLSyncWord): TFLQueueResult;
+begin
+ConsumeArg(CallData);
+case InterlockedOperation(SyncWord,FastEventEnqueueIOP) of
+  FL_EVENT_IOPRES_SUCCESS:  Result := qrAcquired;
+  FL_EVENT_IOPRES_PULSING,
+  FL_EVENT_IOPRES_WAITERS:  Result := qrFailed;
+  FL_EVENT_IOPRES_QUEUED:   Result := qrQueued;
+else
+ {FL_EVENT_IOPRES_INVALID}
+  raise EFLInvalidState.Create('FastEventEnqueue: Invalid state of event sync word.');
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastEventQueuedAcquire(var SyncWord: TFLSyncWord; CallData: TFLSyncWord): Boolean;
+begin
+ConsumeArg(CallData);
+case InterlockedOperation(SyncWord,FastEventQueuedAcquireIOP) of
+  FL_EVENT_IOPRES_SUCCESS:  Result := True;
+  FL_EVENT_IOPRES_LOCKED:   Result := False;
+else
+ {FL_EVENT_IOPRES_INVALID}
+  raise EFLInvalidState.Create('FastEventQueuedAcquire: Invalid state of event sync word.');
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure FastEventDequeue(var SyncWord: TFLSyncWord; CallData: TFLSyncWord);
+begin
+ConsumeArg(CallData);
+If InterlockedOperation(SyncWord,FastEventDequeueIOP) <> FL_EVENT_IOPRES_SUCCESS then
+  raise EFLInvalidState.Create('FastEventDequeue: Invalid state of event sync word.');
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastEventWaitToPass(var SyncWord: TFLSyncWord; WaitParams: TFLWaitParams; ClockFrequency: Int64): TFLWaitResult; overload;
+var
+  WaitParamsInternal: TFLWaitParamsInternal;
+begin
+WaitParamsInternal.PublicParams.WaitParams := WaitParams;
+If not GetClockValue(WaitParamsInternal.PublicParams.ClockStart) then
+  raise EFLClockError.Create('FastEventWaitToPass: Unable to obtain clock value.');
+WaitParamsInternal.PublicParams.ClockFreq := ClockFrequency;
+WaitParamsInternal.SyncWordPtr := Addr(SyncWord);
+WaitParamsInternal.EnqueueFce := FastEventEnqueue;
+WaitParamsInternal.QueuedAcquireFce := FastEventQueuedAcquire;
+WaitParamsInternal.DequeueFce := FastEventDequeue;
+WaitParamsInternal.CallData := 0;
+Result := ExecuteWaiting(WaitParamsInternal);
+end;
+
+{===============================================================================
+    Fast event - procedural interface implementation
+===============================================================================}
+
+procedure FastEventInit(out SyncWord: TFLSyncWord; ManualReset: Boolean = False; InitialState: Boolean = False);
+var
+  SyncWordValue:  TFLSyncWord;
+begin
+// M := ManualReset, L := not InitialState
+SyncWordValue := TFLSyncWord(FL_INITVAL or FL_EVENT_MASK_VALID);
+If ManualReset then
+  SyncWordValue := SyncWordValue or FL_EVENT_MASK_MANUALRESET;
+If not InitialState then
+  SyncWordValue := SyncWordValue or FL_EVENT_MASK_LOCK;
+InterlockedStore(TFLSyncWord((@SyncWord)^),SyncWordValue);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure FastEventFinal(var SyncWord: TFLSyncWord);
+begin
+InterlockedStore(SyncWord,FL_INITVAL);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure FastEventSet(var SyncWord: TFLSyncWord);
+begin
+If not IsValid(InterlockedAnd(SyncWord,not(FL_EVENT_MASK_LOCK or FL_EVENT_MASK_PULSING))) then
+  raise EFLInvalidState.Create('FastEventSet: Invalid state of event sync word.');
+end;
+
+//------------------------------------------------------------------------------
+
+procedure FastEventReset(var SyncWord: TFLSyncWord);
+begin
+If InterlockedOperation(SyncWord,FastEventResetIOP) = FL_EVENT_IOPRES_INVALID then
+  raise EFLInvalidState.Create('FastEventReset: Invalid state of event sync word.');
+end;
+
+//------------------------------------------------------------------------------
+
+procedure FastEventPulse(var SyncWord: TFLSyncWord);
+begin
+If InterlockedOperation(SyncWord,FastEventPulseIOP) = FL_EVENT_IOPRES_INVALID then
+  raise EFLInvalidState.Create('FastEventPulse: Invalid state of event sync word.');
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastEventPass(var SyncWord: TFLSyncWord): Boolean;
+begin
+case InterlockedOperation(SyncWord,FastEventPassIOP) of
+  FL_EVENT_IOPRES_SUCCESS:  Result := True;
+  FL_EVENT_IOPRES_LOCKED,
+  FL_EVENT_IOPRES_PULSING,
+  FL_EVENT_IOPRES_WAITERS:  Result := False;
+else
+ {FL_EVENT_IOPRES_INVALID}
+  raise EFLInvalidState.Create('FastEventPass: Invalid state of event sync word.');
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastEventSpinToPass(var SyncWord: TFLSyncWord; SpinParams: TFLSpinParams): TFLWaitResult;
+var
+  WaitParamsInternal: TFLWaitParamsInternal;
+begin
+WaitParamsInternal.PublicParams.SpinParams := SpinParams;
+WaitParamsInternal.SyncWordPtr := Addr(SyncWord);
+WaitParamsInternal.EnqueueFce := FastEventEnqueue;
+WaitParamsInternal.QueuedAcquireFce := FastEventQueuedAcquire;
+WaitParamsInternal.DequeueFce := FastEventDequeue;
+WaitParamsInternal.CallData := 0;
+Result := ExecuteSpinning(WaitParamsInternal);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function FastEventSpinToPass(var SyncWord: TFLSyncWord; SpinCount: UInt32): TFLWaitResult;
+var
+  SpinParams: TFLSpinParams;
+begin
+SpinParams := DefaultSpinParams;
+SpinParams.SpinCount := SpinCount;
+Result := FastEventSpinToPass(SyncWord,SpinParams);
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastEventWaitToPass(var SyncWord: TFLSyncWord; WaitParams: TFLWaitParams): TFLWaitResult;
+var
+  ClockFrequency: Int64;
+begin
+If not GetClockFrequency(ClockFrequency) then
+  raise EFLClockError.Create('FastEventWaitToPass: Unable to obtain clock frequency.');
+Result := FastEventWaitToPass(SyncWord,WaitParams,ClockFrequency);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function FastEventWaitToPass(var SyncWord: TFLSyncWord; Timeout: UInt32): TFLWaitResult;
+var
+  WaitParams: TFLWaitParams;
+begin
+WaitParams := DefaultWaitParams;
+WaitParams.Timeout := Timeout;
+Result := FastEventWaitToPass(SyncWord,WaitParams);
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                   TFastEvent
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TFastEvent - class declaration
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TFastEvent - protected methods implementation
+-------------------------------------------------------------------------------}
+
+procedure TFastEvent.SyncWordInit(const InitArgs: array of const);
+var
+  ManualReset:  Boolean;
+  InitialState: Boolean;
+begin
+ManualReset := False;
+If ArgTypePresent(InitArgs,0,vtBoolean) then
+  ManualReset := InitArgs[0].VBoolean;
+InitialState := False;
+If ArgTypePresent(InitArgs,1,vtBoolean) then
+  InitialState := InitArgs[1].VBoolean;
+FastEventInit(fSyncWordPtr^,ManualReset,InitialState);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TFastEvent.SyncWordFinal;
+begin
+FastEventFinal(fSyncWordPtr^);
+end;
+
+{-------------------------------------------------------------------------------
+    TFastEvent - public methods implementation
+-------------------------------------------------------------------------------}
+
+constructor TFastEvent.Create(ManualReset: Boolean; InitialState: Boolean);
+begin
+CreateBase;
+fMode := flmOwner;
+Initialize(@fSyncWord,True,[ManualReset,InitialState]);
+AcquireReference;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TFastEvent.Create(var SyncWord: TFLSyncWord; ManualReset: Boolean; InitialState: Boolean);
+begin
+CreateBase;
+fMode := flmWrapper;
+Initialize(@SyncWord,True,[ManualReset,InitialState]);
+AcquireReference;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TFastEvent.EventSet;
+begin
+FastEventSet(fSyncWordPtr^);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TFastEvent.EventReset;
+begin
+FastEventReset(fSyncWordPtr^);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TFastEvent.EventPulse;
+begin
+FastEventPulse(fSyncWordPtr^);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TFastEvent.EventPass: Boolean;
+begin
+Result := FastEventPass(fSyncWordPtr^);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TFastEvent.EventSpinToPass(SpinCount: UInt32): TFLWaitResult;
+var
+  LocalSpinParams:  TFLSpinParams;
+begin
+LocalSpinParams := fSpinParams;
+LocalSpinParams.SpinCount := SpinCount;
+Result := FastEventSpinToPass(fSyncWordPtr^,LocalSpinParams);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function TFastEvent.EventSpinToPass: TFLWaitResult;
+begin
+Result := FastEventSpinToPass(fSyncWordPtr^,fSpinParams);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TFastEvent.EventWaitToPass(Timeout: UInt32): TFLWaitResult;
+var
+  LocalWaitParams:  TFLWaitParams;
+begin
+LocalWaitParams := fWaitParams;
+LocalWaitParams.Timeout := Timeout;
+Result := FastEventWaitToPass(fSyncWordPtr^,LocalWaitParams,fClockFreq);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function TFastEvent.EventWaitToPass: TFLWaitResult;
+begin
+Result := FastEventWaitToPass(fSyncWordPtr^,fWaitParams,fClockFreq);
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 Fast semaphore
+--------------------------------------------------------------------------------
+===============================================================================}
+{
+               HI      - (V) validity bit, must be 1
+      HI-10 .. HI-1    - (W) wait counter (max 1023 waiters)
+          0 .. HI-11   - (C) main counter (0 non signaled, >0 signaled, max
+                             value 2097151 or 9007199254740991)
+}
+const
+  FL_SEMAPHORE_MASK_VALID       = FL_COMMON_MASK_VALID;
+  FL_SEMAPHORE_MASK_WAITCOUNTER = ((TFLSyncWord(1) shl 10) - 1) shl (FL_WORDHIBIT - 10);
+  FL_SEMAPHORE_MASK_MAINCOUNTER = (TFLSyncWord(1) shl (FL_WORDHIBIT - 10)) - 1;
+
+  FL_SEMAPHORE_DELTA_WAIT = TFLSyncWord(1) shl (FL_WORDHIBIT - 10);
+
+  FL_SEMAPHORE_IOPRES_INVALID  = -1;
+  FL_SEMAPHORE_IOPRES_SUCCESS  = 0;
+  FL_SEMAPHORE_IOPRES_LOCKED   = 1;
+  FL_SEMAPHORE_IOPRES_WAITERS  = 2;
+  FL_SEMAPHORE_IOPRES_OVERFLOW = 3;
+  FL_SEMAPHORE_IOPRES_QUEUED   = 4;
+
+{===============================================================================
+    Fast semaphore - internal functions implementation
+===============================================================================}
+
+Function FastSemaphoreAcquireIOP(var SyncWord: TFLSyncWord; AcquireCount: TFLSyncWord): TFLSyncWord; register;
+begin
+// AcquireCount must be properly masked or bound-checked but unshifted before passing it here
+If (SyncWord and FL_SEMAPHORE_MASK_VALID) <> 0 then
+  begin
+  {
+    Asynchronous acquire can be done only when there is no waiter and of
+    course the state is signaled (main counter must be at least equal to
+    acquire count).
+  }
+    If (SyncWord and FL_SEMAPHORE_MASK_MAINCOUNTER) >= AcquireCount then
+      begin
+        If (SyncWord and FL_SEMAPHORE_MASK_WAITCOUNTER) = 0 then
+          begin
+            SyncWord := SyncWord - AcquireCount;
+            Result := FL_SEMAPHORE_IOPRES_SUCCESS;
+          end
+        else Result := FL_SEMAPHORE_IOPRES_WAITERS;
+      end
+    else If (SyncWord and FL_SEMAPHORE_MASK_MAINCOUNTER) <> 0 then
+      Result := FL_SEMAPHORE_IOPRES_OVERFLOW
+    else
+      Result := FL_SEMAPHORE_IOPRES_LOCKED;
+  end
+else Result := FL_SEMAPHORE_IOPRES_INVALID;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastSemaphoreReleaseIOP(var SyncWord: TFLSyncWord; ReleaseCount: TFLSyncWord): TFLSyncWord; register;
+begin
+// ReleaseCount must be checked externally
+If (SyncWord and FL_SEMAPHORE_MASK_VALID) <> 0 then
+  begin
+    // allow release only if release count cannot overflow counter
+    If (SyncWord and FL_SEMAPHORE_MASK_MAINCOUNTER) <= (FL_SEMAPHORE_MASK_MAINCOUNTER - ReleaseCount) then
+      begin
+        SyncWord := SyncWord + ReleaseCount;
+        Result := FL_SEMAPHORE_IOPRES_SUCCESS;
+      end
+    else Result := FL_SEMAPHORE_IOPRES_OVERFLOW;
+  end
+else Result := FL_SEMAPHORE_IOPRES_INVALID;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastSemaphoreEnqueueIOP(var SyncWord: TFLSyncWord; AcquireCount: TFLSyncWord): TFLSyncWord; register;
+begin
+If (SyncWord and FL_SEMAPHORE_MASK_VALID) <> 0 then
+  begin
+    If (SyncWord and FL_SEMAPHORE_MASK_MAINCOUNTER) >= AcquireCount then
+      begin
+        // we can acquire the semaphore directly (do not check for waiters)
+        SyncWord := SyncWord - AcquireCount;
+        Result := FL_SEMAPHORE_IOPRES_SUCCESS;
+      end
+    // try to enqueue
+    else If (SyncWord and FL_SEMAPHORE_MASK_WAITCOUNTER) < FL_SEMAPHORE_MASK_WAITCOUNTER then
+      begin
+        SyncWord := SyncWord + FL_SEMAPHORE_DELTA_WAIT;
+        Result := FL_SEMAPHORE_IOPRES_QUEUED;
+      end
+    else Result := FL_SEMAPHORE_IOPRES_WAITERS;
+  end
+else Result := FL_SEMAPHORE_IOPRES_INVALID;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastSemaphoreQueuedAcquireIOP(var SyncWord: TFLSyncWord; AcquireCount: TFLSyncWord): TFLSyncWord; register;
+begin
+If ((SyncWord and FL_SEMAPHORE_MASK_VALID) <> 0) and ((SyncWord and FL_SEMAPHORE_MASK_WAITCOUNTER) <> 0) then
+  begin
+    If (SyncWord and FL_SEMAPHORE_MASK_MAINCOUNTER) >= AcquireCount then
+      begin
+        // can acquire...
+        SyncWord := SyncWord - AcquireCount;
+        // dequeue
+        SyncWord := SyncWord - FL_SEMAPHORE_DELTA_WAIT;
+        Result := FL_SEMAPHORE_IOPRES_SUCCESS;
+      end
+    else If (SyncWord and FL_SEMAPHORE_MASK_MAINCOUNTER) <> 0 then
+      Result := FL_SEMAPHORE_IOPRES_OVERFLOW
+    else
+      Result := FL_SEMAPHORE_IOPRES_LOCKED;
+  end
+else Result := FL_SEMAPHORE_IOPRES_INVALID;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastSemaphoreDequeueIOP(var SyncWord: TFLSyncWord): TFLSyncWord; register;
+begin
+If ((SyncWord and FL_SEMAPHORE_MASK_VALID) <> 0) and ((SyncWord and FL_SEMAPHORE_MASK_WAITCOUNTER) <> 0) then
+  begin
+    SyncWord := SyncWord - FL_SEMAPHORE_DELTA_WAIT;
+    Result := FL_SEMAPHORE_IOPRES_SUCCESS;
+  end
+else  Result := FL_SEMAPHORE_IOPRES_INVALID;
+end;
+
+//==============================================================================
+
+Function FastSemaphoreEnqueue(var SyncWord: TFLSyncWord; AcquireCount: TFLSyncWord): TFLQueueResult;
+begin
+case InterlockedOperation(SyncWord,AcquireCount,FastSemaphoreEnqueueIOP) of
+  FL_SEMAPHORE_IOPRES_SUCCESS:  Result := qrAcquired;
+  FL_SEMAPHORE_IOPRES_WAITERS:  Result := qrFailed;
+  FL_SEMAPHORE_IOPRES_QUEUED:   Result := qrQueued;
+else
+ {FL_SEMAPHORE_IOPRES_INVALID}
+  raise EFLInvalidState.Create('FastSemaphoreEnqueue: Invalid state of semaphore sync word.');
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastSemaphoreQueuedAcquire(var SyncWord: TFLSyncWord; AcquireCount: TFLSyncWord): Boolean;
+begin
+case InterlockedOperation(SyncWord,AcquireCount,FastSemaphoreQueuedAcquireIOP) of
+  FL_SEMAPHORE_IOPRES_SUCCESS:  Result := True;
+  FL_SEMAPHORE_IOPRES_LOCKED,
+  FL_SEMAPHORE_IOPRES_OVERFLOW: Result := False;
+else
+ {FL_SEMAPHORE_IOPRES_INVALID}
+  raise EFLInvalidState.Create('FastSemaphoreQueuedAcquire: Invalid state of semaphore sync word.');
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure FastSemaphoreDequeue(var SyncWord: TFLSyncWord; CallData: TFLSyncWord);
+begin
+ConsumeArg(CallData);
+If InterlockedOperation(SyncWord,FastSemaphoreDequeueIOP) <> FL_SEMAPHORE_IOPRES_SUCCESS then
+  raise EFLInvalidState.Create('FastSemaphoreDequeue: Invalid state of semaphore sync word.');
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastSemaphoreWaitToAcquire(var SyncWord: TFLSyncWord; WaitParams: TFLWaitParams; ClockFrequency: Int64; AcquireCount: TFLSyncWord): TFLWaitResult; overload;
+var
+  WaitParamsInternal: TFLWaitParamsInternal;
+begin
+WaitParamsInternal.PublicParams.WaitParams := WaitParams;
+If not GetClockValue(WaitParamsInternal.PublicParams.ClockStart) then
+  raise EFLClockError.Create('FastSemaphoreWaitToAcquire: Unable to obtain clock value.');
+WaitParamsInternal.PublicParams.ClockFreq := ClockFrequency;
+WaitParamsInternal.SyncWordPtr := Addr(SyncWord);
+WaitParamsInternal.EnqueueFce := FastSemaphoreEnqueue;
+WaitParamsInternal.QueuedAcquireFce := FastSemaphoreQueuedAcquire;
+WaitParamsInternal.DequeueFce := FastSemaphoreDequeue;
+WaitParamsInternal.CallData := AcquireCount;
+Result := ExecuteWaiting(WaitParamsInternal);
+end;
+
+{===============================================================================
+    Fast semaphore - procedural interface implementation
+===============================================================================}
+
+procedure FastSemaphoreInit(out SyncWord: TFLSyncWord; InitialCount: TFLSyncWord = 0);
+var
+  SyncWordValue:  TFLSyncWord;
+begin
+SyncWordValue := TFLSyncWord(FL_INITVAL or FL_SEMAPHORE_MASK_VALID);
+// check bounds for initial value of main counter
+If (InitialCount < 0) or (InitialCount > FL_SEMAPHORE_MASK_MAINCOUNTER) then
+  raise EFLInvalidValue.CreateFmt('FastSemaphoreInit: Invalid semaphore count (%d)',[InitialCount]);
+SyncWordValue := SyncWordValue or (InitialCount and FL_SEMAPHORE_MASK_MAINCOUNTER);
+InterlockedStore(TFLSyncWord((@SyncWord)^),SyncWordValue);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure FastSemaphoreFinal(var SyncWord: TFLSyncWord);
+begin
+InterlockedStore(SyncWord,FL_INITVAL);
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastSemaphoreCount(var SyncWord: TFLSyncWord): TFLSyncWord;
+begin
+Result := InterlockedLoad(SyncWord);
+If IsValid(Result) then
+  Result := Result and FL_SEMAPHORE_MASK_MAINCOUNTER
+else
+  raise EFLInvalidState.Create('FastSemaphoreCount: Invalid state of semaphore sync word.');
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastSemaphoreAcquire(var SyncWord: TFLSyncWord; AcquireCount: TFLSyncWord = 1): Boolean;
+begin
+If (AcquireCount <= 0) or (AcquireCount > FL_SEMAPHORE_MASK_MAINCOUNTER) then
+  raise EFLInvalidValue.CreateFmt('FastSemaphoreAcquire: Invalid semaphore acquire count (%d)',[AcquireCount]);
+case InterlockedOperation(SyncWord,AcquireCount,FastSemaphoreAcquireIOP) of
+  FL_SEMAPHORE_IOPRES_SUCCESS:  Result := True;
+  FL_SEMAPHORE_IOPRES_LOCKED,
+  FL_SEMAPHORE_IOPRES_WAITERS,
+  FL_SEMAPHORE_IOPRES_OVERFLOW: Result := False;
+else
+ {FL_SEMAPHORE_IOPRES_INVALID}
+  raise EFLInvalidState.Create('FastSemaphoreAcquire: Invalid state of semaphore sync word.');
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastSemaphoreRelease(var SyncWord: TFLSyncWord; ReleaseCount: TFLSyncWord = 1): Boolean;
+begin
+If (ReleaseCount <= 0) or (ReleaseCount > FL_SEMAPHORE_MASK_MAINCOUNTER) then
+  raise EFLInvalidValue.CreateFmt('FastSemaphoreAcquire: Invalid semaphore release count (%d)',[ReleaseCount]);  
+case InterlockedOperation(SyncWord,ReleaseCount,FastSemaphoreReleaseIOP) of
+  FL_SEMAPHORE_IOPRES_SUCCESS:  Result := True;
+  FL_SEMAPHORE_IOPRES_OVERFLOW: Result := False;
+else
+ {FL_SEMAPHORE_IOPRES_INVALID}
+  raise EFLInvalidState.Create('FastSemaphoreRelease: Invalid state of semaphore sync word.');
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastSemaphoreSpinToAcquire(var SyncWord: TFLSyncWord; SpinParams: TFLSpinParams; AcquireCount: TFLSyncWord = 1): TFLWaitResult;
+var
+  WaitParamsInternal: TFLWaitParamsInternal;
+begin
+If (AcquireCount <= 0) or (AcquireCount > FL_SEMAPHORE_MASK_MAINCOUNTER) then
+  raise EFLInvalidValue.CreateFmt('FastSemaphoreSpinToAcquire: Invalid semaphore acquire count (%d)',[AcquireCount]);
+WaitParamsInternal.PublicParams.SpinParams := SpinParams;
+WaitParamsInternal.SyncWordPtr := Addr(SyncWord);
+WaitParamsInternal.EnqueueFce := FastSemaphoreEnqueue;
+WaitParamsInternal.QueuedAcquireFce := FastSemaphoreQueuedAcquire;
+WaitParamsInternal.DequeueFce := FastSemaphoreDequeue;
+WaitParamsInternal.CallData := AcquireCount;
+Result := ExecuteSpinning(WaitParamsInternal);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function FastSemaphoreSpinToAcquire(var SyncWord: TFLSyncWord; SpinCount: UInt32; AcquireCount: TFLSyncWord = 1): TFLWaitResult;
+var
+  SpinParams: TFLSpinParams;
+begin
+// acquire count is checked in called overload of FastSemaphoreSpinToAcquire
+SpinParams := DefaultSpinParams;
+SpinParams.SpinCount := SpinCount;
+Result := FastSemaphoreSpinToAcquire(SyncWord,SpinParams,AcquireCount);
+end;
+
+//------------------------------------------------------------------------------
+
+Function FastSemaphoreWaitToAcquire(var SyncWord: TFLSyncWord; WaitParams: TFLWaitParams; AcquireCount: TFLSyncWord = 1): TFLWaitResult;
+var
+  ClockFrequency: Int64;
+begin
+If (AcquireCount <= 0) or (AcquireCount > FL_SEMAPHORE_MASK_MAINCOUNTER) then
+  raise EFLInvalidValue.CreateFmt('FastSemaphoreWaitToAcquire: Invalid semaphore acquire count (%d)',[AcquireCount]);
+If not GetClockFrequency(ClockFrequency) then
+  raise EFLClockError.Create('FastSemaphoreWaitToAcquire: Unable to obtain clock frequency.');
+Result := FastSemaphoreWaitToAcquire(SyncWord,WaitParams,ClockFrequency,AcquireCount);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function FastSemaphoreWaitToAcquire(var SyncWord: TFLSyncWord; Timeout: UInt32; AcquireCount: TFLSyncWord = 1): TFLWaitResult;
+var
+  WaitParams: TFLWaitParams;
+begin
+If (AcquireCount <= 0) or (AcquireCount > FL_SEMAPHORE_MASK_MAINCOUNTER) then
+  raise EFLInvalidValue.CreateFmt('FastSemaphoreWaitToAcquire: Invalid semaphore acquire count (%d)',[AcquireCount]);
+WaitParams := DefaultWaitParams;
+WaitParams.Timeout := Timeout;
+Result := FastSemaphoreWaitToAcquire(SyncWord,WaitParams,AcquireCount);
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 TFastSemaphore
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TFastSemaphore - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TFastSemaphore - protected methods implementation
+-------------------------------------------------------------------------------}
+
+procedure TFastSemaphore.SyncWordInit(const InitArgs: array of const);
+var
+  InitialCount: TFLSyncWord;
+begin
+InitialCount := 0;
+{$IFDEF SyncWord64}
+If ArgTypePresent(InitArgs,0,vtInt64) then
+  InitialCount := InitArgs[0].VInt64^;  // int64 is stored only as reference
+{$ELSE}
+If ArgTypePresent(InitArgs,0,vtInteger) then
+  InitialCount := InitArgs[0].VInteger;
+{$ENDIF}
+FastSemaphoreInit(fSyncWordPtr^,InitialCount);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TFastSemaphore.SyncWordFinal;
+begin
+FastSemaphoreFinal(fSyncWordPtr^);
+end;
+
+{-------------------------------------------------------------------------------
+    TFastSemaphore - public methods implementation
+-------------------------------------------------------------------------------}
+
+constructor TFastSemaphore.Create(InitialCount: TFLSyncWord);
+begin
+CreateBase;
+fMode := flmOwner;
+Initialize(@fSyncWord,True,[InitialCount]);
+AcquireReference;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TFastSemaphore.Create(var SyncWord: TFLSyncWord; InitialCount: TFLSyncWord);
+begin
+CreateBase;
+fMode := flmWrapper;
+Initialize(@SyncWord,True,[InitialCount]);
+AcquireReference;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TFastSemaphore.SemaphoreCount: TFLSyncWord;
+begin
+Result := FastSemaphoreCount(fSyncWordPtr^);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TFastSemaphore.SemaphoreAcquire(AcquireCount: TFLSyncWord = 1): Boolean;
+begin
+Result := FastSemaphoreAcquire(fSyncWordPtr^,AcquireCount);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TFastSemaphore.SemaphoreRelease(ReleaseCount: TFLSyncWord = 1): Boolean;
+begin
+Result := FastSemaphoreRelease(fSyncWordPtr^,ReleaseCount);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TFastSemaphore.SemaphoreSpinToAcquireBy(SpinCount: UInt32; AcquireCount: TFLSyncWord): TFLWaitResult;
+var
+  LocalSpinParams:  TFLSpinParams;
+begin
+LocalSpinParams := fSpinParams;
+LocalSpinParams.SpinCount := SpinCount;
+Result := FastSemaphoreSpinToAcquire(fSyncWordPtr^,LocalSpinParams,AcquireCount);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function TFastSemaphore.SemaphoreSpinToAcquireBy(AcquireCount: TFLSyncWord): TFLWaitResult;
+begin
+Result := FastSemaphoreSpinToAcquire(fSyncWordPtr^,fSpinParams,AcquireCount);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TFastSemaphore.SemaphoreSpinToAcquire(SpinCount: UInt32): TFLWaitResult;
+begin
+Result := SemaphoreSpinToAcquireBy(SpinCount,1);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function TFastSemaphore.SemaphoreSpinToAcquire: TFLWaitResult;
+begin
+Result := SemaphoreSpinToAcquireBy(1);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TFastSemaphore.SemaphoreWaitToAcquireBy(Timeout: UInt32; AcquireCount: TFLSyncWord): TFLWaitResult;
+var
+  LocalWaitParams:  TFLWaitParams;
+begin
+LocalWaitParams := fWaitParams;
+LocalWaitParams.Timeout := Timeout;
+Result := FastSemaphoreWaitToAcquire(fSyncWordPtr^,LocalWaitParams,fClockFreq,AcquireCount);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function TFastSemaphore.SemaphoreWaitToAcquireBy(AcquireCount: TFLSyncWord): TFLWaitResult;
+begin
+Result := FastSemaphoreWaitToAcquire(fSyncWordPtr^,fWaitParams,fClockFreq,AcquireCount);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TFastSemaphore.SemaphoreWaitToAcquire(Timeout: UInt32): TFLWaitResult;
+begin
+Result := SemaphoreWaitToAcquireBy(Timeout,1);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function TFastSemaphore.SemaphoreWaitToAcquire: TFLWaitResult;
+begin
+Result := SemaphoreWaitToAcquireBy(1);
+end;
+
+(*
 {===============================================================================
 --------------------------------------------------------------------------------
                                    Fast locks
@@ -749,20 +2539,20 @@ Function _DoWait(Params: TFLWaitParams): TFLWaitResult;
             begin
               // still in timeout period, do delaying
               case Params.WaitDelayMethod of
-                wdNone:;      // do nothing;
-                wdYield:      YieldThread;
+                dmNone:;      // do nothing;
+                dmYield:      YieldThread;
               {$IFDEF Windows}
-                wdSleep:      Sleep(10);
-                wdSleepEx:    SleepEx(10,True);
-                wdYieldSleep: If not YieldThread then
+                dmSleep:      Sleep(10);
+                dmSleepEx:    SleepEx(10,True);
+                dmYieldSleep: If not YieldThread then
                                 Sleep(10);
               {$ELSE}
-                wdSleep,
-                wdSleepEx,
-                wdYieldSleep: Sleep(10);
+                dmSleep,
+                dmSleepEx,
+                dmYieldSleep: Sleep(10);
               {$ENDIF}
               else
-               {wdSpin}
+               {dmSpin}
                 // fill parameters for spinning
                 SpinParams.SyncWordPtr := Params.SyncWordPtr;
                 SpinParams.SpinCount := Params.WaitSpinCount;
@@ -872,7 +2662,7 @@ begin
 fSyncWord := FL_UNLOCKED;
 fSyncWordPtr := SyncWordPtr;
 fOwnsSyncWord := fSyncWordPtr = Addr(fSyncWord);
-SetWaitDelayMethod(wdSpin);
+SetWaitDelayMethod(dmSpin);
 SetWaitSpinCount(FL_DEF_WAIT_SPIN_CNT);
 SetSpinDelayCount(FL_DEF_SPIN_DELAY_CNT);
 If not GetCounterFrequency(fCounterFreq) then
@@ -1079,7 +2869,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function FastCriticalSectionWaitToEnter(var SyncWord: TFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin;
+Function FastCriticalSectionWaitToEnter(var SyncWord: TFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = dmSpin;
   WaitSpinCount: UInt32 = FL_DEF_WAIT_SPIN_CNT; SpinDelayCount: UInt32 = FL_DEF_SPIN_DELAY_CNT): TFLWaitResult;
 var
   CounterFrequency: Int64;
@@ -1377,7 +3167,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function FastMREWWaitToRead(var SyncWord: TFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin;
+Function FastMREWWaitToRead(var SyncWord: TFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = dmSpin;
   WaitSpinCount: UInt32 = FL_DEF_WAIT_SPIN_CNT; SpinDelayCount: UInt32 = FL_DEF_SPIN_DELAY_CNT): TFLWaitResult;
 var
   CounterFrequency: Int64;
@@ -1429,7 +3219,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function FastMREWWaitToWrite(var SyncWord: TFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = wdSpin;
+Function FastMREWWaitToWrite(var SyncWord: TFLSyncWord; Timeout: UInt32; WaitDelayMethod: TFLWaitDelayMethod = dmSpin;
   WaitSpinCount: UInt32 = FL_DEF_WAIT_SPIN_CNT; SpinDelayCount: UInt32 = FL_DEF_SPIN_DELAY_CNT): TFLWaitResult;
 var
   CounterFrequency: Int64;
@@ -1530,6 +3320,7 @@ begin
 Result := _FastMREWWaitToWrite(fSyncWordPtr^,Timeout,GetWaitDelayMethod,GetWaitSpinCount,GetSpinDelayCount,fCounterFreq);
 ReadWriteBarrier;
 end;
-
+*)
 end.
+
 
