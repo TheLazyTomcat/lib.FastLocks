@@ -125,9 +125,9 @@
         (events migh pose exception here, see their description), synhronizers
         are not automalically released
 
-  Version 2.0 (2026-06-05)
+  Version 2.0.1 (2026-06-09)
 
-  Last change 2026-06-05
+  Last change 2026-06-09
 
   ©2016-2026 František Milt
 
@@ -1706,7 +1706,10 @@ Function ExecuteSpinning(WaitParamsInternal: TFLWaitParamsInternal): TFLWaitResu
 begin
 case WaitParamsInternal.EnqueueFce(WaitParamsInternal.SyncWordPtr^,WaitParamsInternal.CallData) of
   qrAcquired: Result := wrAcquired;
-  qrQueued:   Result := SpinInternal;
+  qrQueued:   If WaitParamsInternal.PublicParams.SpinParams.SpinCount > 0 then
+                Result := SpinInternal
+              else
+                Result := wrTimeout;
   qrDeadlock: Result := wrDeadlock;
 else
  {qrFailed}   Result := wrTryAgain;
@@ -1761,7 +1764,10 @@ Function ExecuteWaiting(WaitParamsInternal: TFLWaitParamsInternal): TFLWaitResul
 begin
 case WaitParamsInternal.EnqueueFce(WaitParamsInternal.SyncWordPtr^,WaitParamsInternal.CallData) of
   qrAcquired: Result := wrAcquired;
-  qrQueued:   Result := WaitInternal;
+  qrQueued:   If WaitParamsInternal.PublicParams.WaitParams.Timeout > 0 then
+                Result := WaitInternal
+              else
+                Result := wrTimeout;
   qrDeadlock: Result := wrDeadlock;  
 else
  {qrFailed}   Result := wrTryAgain;
